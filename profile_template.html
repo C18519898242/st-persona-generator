@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  :root {
+    --sheet-width: 1400px;
+    --sheet-height: 1860px;
+    --paper: #f8f4ec;
+    --paper-soft: #f1ece3;
+    --paper-deep: #e9e1d6;
+    --ink: #302a24;
+    --muted: #766d63;
+    --rule: rgba(72, 61, 49, 0.18);
+    --rule-light: rgba(72, 61, 49, 0.10);
+    {{THEME_CSS}}
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { min-height: 100%; }
+  body {
+    background: #d8d3cb;
+    color: var(--ink);
+    font-family: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif;
+    padding: 24px 0;
+  }
+
+  .sheet-shell { position: relative; margin: 0 auto; }
+  .sheet {
+    width: var(--sheet-width);
+    height: var(--sheet-height);
+    padding: 48px 56px;
+    overflow: hidden;
+    position: relative;
+    transform-origin: top left;
+    background:
+      radial-gradient(circle at 86% 5%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 24%),
+      linear-gradient(180deg, #fbf8f2 0%, var(--paper) 56%, #f4eee5 100%);
+    display: grid;
+    grid-template-rows: 132px 822px 330px 292px 108px;
+    gap: 18px;
+  }
+  .sheet::before, .sheet::after {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+  }
+  .sheet::before { inset: 17px; border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+  .sheet::after { inset: 23px; border: 1px solid color-mix(in srgb, var(--accent) 16%, transparent); }
+  .sheet > * { position: relative; z-index: 1; }
+
+  .sheet-header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    border-bottom: 1px solid var(--rule);
+    padding: 0 4px 18px;
+  }
+  .title-line { display: flex; align-items: flex-end; gap: 22px; }
+  h1 {
+    color: #554032;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 70px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    line-height: 0.95;
+  }
+  .name-en {
+    color: color-mix(in srgb, var(--accent) 72%, #5f5147);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 19px;
+    font-style: italic;
+    letter-spacing: 0.08em;
+    padding-bottom: 7px;
+  }
+  .tagline {
+    color: var(--muted);
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 17px;
+    letter-spacing: 0.14em;
+    margin-top: 14px;
+  }
+  .header-seal {
+    width: 86px;
+    height: 86px;
+    border: 1px solid var(--accent);
+    border-radius: 50%;
+    display: grid;
+    place-content: center;
+    text-align: center;
+    color: var(--accent);
+    box-shadow: inset 0 0 0 5px var(--paper), inset 0 0 0 6px color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .header-seal strong { font: 26px/1 Georgia, serif; letter-spacing: 0.06em; }
+  .header-seal small { margin-top: 5px; font-size: 10px; letter-spacing: 0.18em; }
+
+  .profile-main {
+    display: grid;
+    grid-template-columns: 255px minmax(0, 1fr) 350px;
+    gap: 18px;
+  }
+  .panel {
+    border: 1px solid var(--rule);
+    background: rgba(255, 253, 248, 0.40);
+    min-width: 0;
+  }
+  .panel-title {
+    height: 54px;
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    color: #5a4a3f;
+    border-bottom: 1px solid var(--rule);
+    padding: 0 17px;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+  }
+  .panel-title::before {
+    content: "";
+    width: 4px;
+    height: 25px;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  .facts { padding: 15px 17px 12px; }
+  .fact {
+    display: grid;
+    grid-template-columns: 66px 1fr;
+    gap: 7px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--rule-light);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .fact dt { color: var(--muted); letter-spacing: 0.12em; }
+  .fact dd { color: #3b342e; font-weight: 500; }
+  .fact-note {
+    margin: 8px 17px 0;
+    padding: 15px 14px;
+    background: color-mix(in srgb, var(--accent) 8%, #fffaf1);
+    border-left: 2px solid var(--accent);
+    color: #655c53;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 13px;
+    line-height: 1.85;
+    text-align: justify;
+  }
+
+  .turnaround-panel, .expressions-panel { overflow: hidden; }
+  .turnaround-grid {
+    height: calc(100% - 54px);
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    padding: 18px 17px 14px;
+  }
+  .expressions-grid {
+    height: calc(100% - 54px);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(3, minmax(0, 1fr));
+    gap: 13px;
+    padding: 18px 17px 14px;
+  }
+  .image-card {
+    min-width: 0;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) 27px;
+    gap: 7px;
+  }
+  .media-frame {
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: #eee8dd;
+    border: 1px solid rgba(90, 75, 60, 0.11);
+  }
+  .media-frame img {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .media-frame--turnaround img {
+    object-fit: cover;
+    object-position: center center;
+  }
+  .media-frame--turnaround img.focus-front { transform: scale(var(--front-scale)); }
+  .media-frame--turnaround img.focus-side { transform: scale(var(--side-scale)); }
+  .media-frame--turnaround img.focus-back { transform: scale(var(--back-scale)); }
+  .media-frame--expression {
+    width: 100%;
+    aspect-ratio: var(--expression-aspect);
+    align-self: center;
+  }
+  .media-frame--expression img {
+    object-fit: cover;
+    object-position: var(--expression-position);
+  }
+  figcaption {
+    color: #77685d;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 13px;
+    letter-spacing: 0.16em;
+    text-align: center;
+    line-height: 27px;
+  }
+
+  .assets-row {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr 0.82fr;
+    gap: 18px;
+  }
+  .assets-row > .panel {
+    min-height: 0;
+    overflow: hidden;
+  }
+  .asset-grid {
+    height: calc(100% - 54px);
+    min-height: 0;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr);
+    gap: 12px;
+    padding: 14px 16px 12px;
+  }
+  .items-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .details-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .media-frame--item img { object-fit: contain; padding: 7px; }
+  .media-frame--detail img { object-fit: cover; object-position: center 24%; }
+  .media-frame--detail img.focus-full {
+    object-fit: contain;
+    object-position: center center;
+  }
+  .palette-grid {
+    height: calc(100% - 54px);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 17px;
+    align-content: center;
+  }
+  .swatch {
+    display: grid;
+    grid-template-columns: 47px 1fr;
+    grid-template-rows: 1fr 1fr;
+    column-gap: 10px;
+    min-width: 0;
+    align-items: center;
+  }
+  .swatch i {
+    grid-row: 1 / 3;
+    width: 47px;
+    height: 47px;
+    border: 1px solid rgba(48, 42, 36, 0.13);
+  }
+  .swatch b { font-size: 13px; font-weight: 500; }
+  .swatch small { color: var(--muted); font: 10px/1 Consolas, monospace; }
+
+  .summary-row {
+    display: grid;
+    grid-template-columns: 1.22fr 0.95fr 0.82fr;
+    gap: 18px;
+  }
+  .summary-copy {
+    padding: 18px 20px;
+    color: #5f554d;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 14px;
+    line-height: 2;
+    text-align: justify;
+  }
+  .traits {
+    padding: 16px 21px 12px 38px;
+    color: #5f554d;
+    font-size: 13px;
+    line-height: 2.05;
+  }
+  .traits li::marker { color: var(--accent); }
+  .tags {
+    padding: 20px 18px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 13px;
+    align-content: start;
+  }
+  .tags span {
+    border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
+    background: rgba(255, 253, 248, 0.58);
+    color: #665950;
+    padding: 8px 5px;
+    text-align: center;
+    font-family: "Noto Serif SC", "STSong", serif;
+    font-size: 13px;
+    letter-spacing: 0.12em;
+  }
+
+  .sheet-footer {
+    border-top: 1px solid var(--rule);
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 12px 6px 0;
+  }
+  .signature strong {
+    display: block;
+    color: #56443a;
+    font-family: "STKaiti", "KaiTi", serif;
+    font-size: 29px;
+    font-weight: 400;
+    letter-spacing: 0.16em;
+  }
+  .signature span {
+    color: var(--muted);
+    font: italic 14px Georgia, serif;
+    letter-spacing: 0.12em;
+  }
+  .footer-mark {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    color: var(--accent);
+  }
+  .footer-mark::before, .footer-mark::after {
+    content: "";
+    width: 62px;
+    height: 1px;
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  .footer-emblem {
+    width: 63px;
+    height: 63px;
+    border: 1px solid var(--accent);
+    border-radius: 50%;
+    display: grid;
+    place-content: center;
+    text-align: center;
+    font: 26px/1 Georgia, serif;
+  }
+  .footer-emblem small {
+    display: block;
+    margin-top: 4px;
+    font: 8px/1 sans-serif;
+    letter-spacing: 0.15em;
+  }
+
+  @media print {
+    body { background: white; padding: 0; }
+    .sheet-shell { width: var(--sheet-width) !important; height: var(--sheet-height) !important; }
+    .sheet { transform: none !important; }
+  }
+</style>
+</head>
+<body>
+<main class="sheet-shell">
+  <article class="sheet">
+    <header class="sheet-header">
+      <div>
+        <div class="title-line">
+          <h1>{{NAME}}</h1>
+          <div class="name-en">{{NAME_EN}}</div>
+        </div>
+        <p class="tagline">{{TAGLINE}}</p>
+      </div>
+      <div class="header-seal" aria-label="人物印章">
+        <strong>{{SEAL_LETTERS}}</strong>
+        <small>PROFILE</small>
+      </div>
+    </header>
+
+    <section class="profile-main">
+      <aside class="panel">
+        <h2 class="panel-title">基本信息</h2>
+        <dl class="facts">{{FACTS_HTML}}</dl>
+        <p class="fact-note">{{FACT_NOTE}}</p>
+      </aside>
+
+      <section class="panel turnaround-panel">
+        <h2 class="panel-title">人物三视图</h2>
+        <div class="turnaround-grid">{{VIEWS_HTML}}</div>
+      </section>
+
+      <section class="panel expressions-panel">
+        <h2 class="panel-title">表情设定</h2>
+        <div class="expressions-grid">{{EXPRESSIONS_HTML}}</div>
+      </section>
+    </section>
+
+    <section class="assets-row">
+      <section class="panel">
+        <h2 class="panel-title">服装拆解</h2>
+        <div class="asset-grid items-grid">{{ITEMS_HTML}}</div>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">局部细节</h2>
+        <div class="asset-grid details-grid">{{DETAILS_HTML}}</div>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">角色色板</h2>
+        <div class="palette-grid">{{PALETTE_HTML}}</div>
+      </section>
+    </section>
+
+    <section class="summary-row">
+      <section class="panel">
+        <h2 class="panel-title">角色简介</h2>
+        <p class="summary-copy">{{BIO}}</p>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">视觉特征</h2>
+        <ul class="traits">{{TRAITS_HTML}}</ul>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">关键词标签</h2>
+        <div class="tags">{{TAGS_HTML}}</div>
+      </section>
+    </section>
+
+    <footer class="sheet-footer">
+      <div class="signature">
+        <strong>{{NAME}}</strong>
+        <span>{{NAME_EN}}</span>
+      </div>
+      <div class="footer-mark">
+        <div class="footer-emblem">{{SEAL_CN}}<small>{{SEAL_EN}}</small></div>
+      </div>
+    </footer>
+  </article>
+</main>
+<script>
+  function fitProfileSheet() {
+    const shell = document.querySelector(".sheet-shell");
+    const sheet = document.querySelector(".sheet");
+    const width = 1400;
+    const height = 1860;
+    const available = Math.max(320, document.documentElement.clientWidth - 24);
+    const scale = Math.min(1, available / width);
+    shell.style.width = (width * scale) + "px";
+    shell.style.height = (height * scale) + "px";
+    sheet.style.transform = "scale(" + scale + ")";
+  }
+  fitProfileSheet();
+  addEventListener("resize", fitProfileSheet);
+</script>
+</body>
+</html>

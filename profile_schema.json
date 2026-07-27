@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.example/profile_schema.json",
+  "title": "人物简介页配置",
+  "description": "供 generate_profiles.py 使用的人物资料、图片映射和显示参数。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "name",
+    "nameEn",
+    "tagline",
+    "seal",
+    "assetDir",
+    "theme",
+    "facts",
+    "factNote",
+    "bio",
+    "traits",
+    "tags",
+    "images",
+    "display"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "编辑器使用的 Schema 相对路径，不参与页面生成。"
+    },
+    "schemaVersion": {
+      "const": 1,
+      "description": "配置格式版本。"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "人物中文名。"
+    },
+    "nameEn": {
+      "type": "string",
+      "minLength": 1,
+      "description": "页眉和签名区使用的英文名或拼音。"
+    },
+    "tagline": {
+      "type": "string",
+      "minLength": 1,
+      "description": "人物名下方的一句话气质描述。"
+    },
+    "seal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["letters", "cn", "en"],
+      "properties": {
+        "letters": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5,
+          "description": "页眉圆章中的姓名缩写。"
+        },
+        "cn": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3,
+          "description": "页脚圆章中央汉字。"
+        },
+        "en": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12,
+          "description": "页脚圆章中的英文小字。"
+        }
+      }
+    },
+    "assetDir": {
+      "type": "string",
+      "default": "assets_简介",
+      "description": "相对于人物目录的图片和输出目录。"
+    },
+    "theme": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accent", "accentSoft", "palette"],
+      "properties": {
+        "accent": {
+          "$ref": "#/$defs/color",
+          "description": "边框、标题竖线和印章主色。"
+        },
+        "accentSoft": {
+          "$ref": "#/$defs/color",
+          "description": "弱强调色。"
+        },
+        "palette": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "color"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "color": {"$ref": "#/$defs/color"}
+            }
+          }
+        }
+      }
+    },
+    "facts": {
+      "type": "array",
+      "minItems": 1,
+      "description": "左侧基本信息，数组顺序即页面顺序。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "value"],
+        "properties": {
+          "label": {"type": "string", "minLength": 1},
+          "value": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "factNote": {
+      "type": "string",
+      "minLength": 1,
+      "description": "基本信息下方的补充说明。"
+    },
+    "bio": {
+      "type": "string",
+      "minLength": 1,
+      "description": "角色简介正文。"
+    },
+    "traits": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "视觉特征列表。"
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "右下角关键词标签。"
+    },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["views", "expressions", "items", "details"],
+      "properties": {
+        "views": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/image"}
+        },
+        "expressions": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {"$ref": "#/$defs/image"}
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {"$ref": "#/$defs/image"}
+        },
+        "details": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/image"}
+        }
+      }
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frontScale",
+        "sideScale",
+        "backScale",
+        "expressionAspect",
+        "expressionPosition"
+      ],
+      "properties": {
+        "frontScale": {
+          "type": "number",
+          "minimum": 0.8,
+          "maximum": 1.35,
+          "description": "正面图缩放倍数。"
+        },
+        "sideScale": {
+          "type": "number",
+          "minimum": 0.8,
+          "maximum": 1.35,
+          "description": "侧面图缩放倍数。"
+        },
+        "backScale": {
+          "type": "number",
+          "minimum": 0.8,
+          "maximum": 1.35,
+          "description": "背面图缩放倍数。"
+        },
+        "expressionAspect": {
+          "type": "number",
+          "minimum": 0.45,
+          "maximum": 1.4,
+          "description": "表情框宽高比；数值越小，表情图越长。"
+        },
+        "expressionPosition": {
+          "type": "string",
+          "minLength": 1,
+          "description": "表情图 object-position，例如 center 22%。"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "color": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "file"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "图片下方标签，同时用于 alt 文本。"
+        },
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "相对于 assets_简介 的图片文件名。"
+        },
+        "className": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]*$",
+          "description": "可选显示类；三视图通常使用 focus-front、focus-side、focus-back。"
+        }
+      }
+    }
+  }
+}
