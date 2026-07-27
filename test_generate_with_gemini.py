@@ -174,7 +174,7 @@ class CharacterPlanningTests(unittest.TestCase):
             self.assertIn("不要文字", prompt)
         self.assertIn("从头顶到鞋底完整可见", prompts["view"])
         self.assertIn("只改变目标表情", prompts["expression"])
-        self.assertIn("禁止出现人物或人体", prompts["item"])
+        self.assertIn("严禁出现人物、人体", prompts["item"])
 
     def test_back_view_forbids_front_back_comparison(self):
         character = generator.load_character(self.root, "测试人物")
@@ -199,10 +199,11 @@ class CharacterPlanningTests(unittest.TestCase):
 
         prompt = generator.build_prompt(character, task)
 
-        self.assertIn("衣物必须平铺或悬空独立展示", prompt)
-        self.assertIn("不得出现手、脚、腿、人体轮廓或人体阴影", prompt)
-        self.assertIn("这不是隐形模特摄影", prompt)
-        self.assertIn("任何人类身体部位都会使结果无效", prompt)
+        self.assertIn("上装单件", prompt)
+        self.assertIn("电商产品图", prompt)
+        self.assertIn("严禁整套穿搭拼贴", prompt)
+        self.assertIn("这不是穿在身上的效果图", prompt)
+        self.assertIn("只允许出现这一件商品", prompt)
 
 
 class GeminiClientTests(unittest.TestCase):

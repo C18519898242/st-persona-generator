@@ -59,6 +59,17 @@ FIXED_ITEM_FILES = [
     "item_shoes.jpg",
 ]
 DEFAULT_ITEM_LABELS = ["上装", "下装", "丝袜", "鞋子"]
+ITEM_SLOT_HINTS = (
+    "上装单件（如衬衫、T恤、外套、开衫，禁止整套造型名）",
+    "下装单件（如短裙、长裤、半身裙，禁止整套造型名）",
+    "袜类单件（如丝袜、连裤袜、船袜；无袜可写肉色丝袜或光腿用肉色丝）",
+    "鞋类单件（如高跟鞋、凉鞋、皮鞋，禁止整套造型名）",
+)
+# Labels that look like outfit/role names rather than a single garment.
+_BAD_ITEM_LABEL_RE = re.compile(
+    r"(警官|便装|制服|战斗|姿态|造型|套装|全身|立绘|角色|人物|"
+    r"场景|职业装|工作装|日常装|私服|夜场)"
+)
 
 
 @dataclass(frozen=True)
@@ -400,6 +411,7 @@ def merge_profile(
                 )
         if polished:
             merged["facts"] = polished
+    character_name = str(merged.get("name") or "").strip()
     if isinstance(patch.get("images"), dict):
         items = patch["images"].get("items")
         if isinstance(items, list):
@@ -407,8 +419,21 @@ def merge_profile(
                 if index < len(items) and isinstance(items[index], dict):
                     label = items[index].get("label")
                     if isinstance(label, str) and label.strip():
-                        merged["images"]["items"][index]["label"] = label.strip()
+                        cleaned = normalize_item_label(
+                            label.strip(),
+                            slot_index=index,
+                            character_name=character_name,
+                        )
+                        if cleaned is not None:
+                            merged["images"]["items"][index]["label"] = cleaned
                 merged["images"]["items"][index]["file"] = filename
+    # Fill any remaining bad/default labels from work outfit / traits text.
+    fill_item_labels_from_card_text(
+        merged,
+        work_outfit=str(skeleton.get("_work_outfit") or ""),
+        appearance=str(skeleton.get("_appearance") or ""),
+        traits=merged.get("traits") if isinstance(merged.get("traits"), list) else [],
+    )
     # re-apply locks
     merged["schemaVersion"] = 1
     merged["assetDir"] = "assets_简介"
@@ -531,6 +556,114 @@ def profile_for_disk(config: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in config.items() if not key.startswith("_")}
 
 
+def normalize_item_label(
+    label: str,
+    *,
+    slot_index: int,
+    character_name: str = "",
+) -> str | None:
+    """Return a single-garment label, or None if the model label is unusable."""
+    text = label.strip()
+    if not text:
+        return None
+    # Reject "角色名+造型" style labels.
+    if character_name and character_name in text and len(text) <= len(character_name) + 8:
+        return None
+    if character_name and text.startswith(character_name):
+        remainder = text[len(character_name) :].strip(" ·-_")
+        if remainder and _BAD_ITEM_LABEL_RE.search(remainder):
+            return None
+        if remainder and len(remainder) <= 6 and _BAD_ITEM_LABEL_RE.search(text):
+            return None
+    if _BAD_ITEM_LABEL_RE.search(text):
+        return None
+    # Too vague defaults are kept only if not pure category words from skeleton.
+    return text
+
+
+def _looks_like_garment_phrase(text: str) -> bool:
+    garment_keys = (
+        "衫", "恤", "衣", "裙", "裤", "袜", "鞋", "靴", "高跟", "凉鞋",
+        "开衫", "外套", "夹克", "大衣", "背心", "丝袜", "连裤", "衬衫",
+        "T恤", "t恤", "罩衫", "卫衣", "羽绒服", "风衣",
+    )
+    return any(key in text for key in garment_keys)
+
+
+def extract_garment_candidates(*texts: str) -> list[str]:
+    """Pull short garment phrases from work outfit / traits prose."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        # Split on common Chinese/English separators.
+        parts = re.split(r"[，,、；;。/\n\|]+", text)
+        for part in parts:
+            piece = part.strip()
+            piece = re.sub(r"^[\-\*·•\d\.\)\s]+", "", piece)
+            piece = re.sub(r"^(内搭|外搭|下着|上穿|脚穿|穿着)\s*", "", piece)
+            if len(piece) < 2 or len(piece) > 24:
+                continue
+            if not _looks_like_garment_phrase(piece):
+                continue
+            if piece in seen:
+                continue
+            seen.add(piece)
+            candidates.append(piece)
+    return candidates
+
+
+def fill_item_labels_from_card_text(
+    config: dict[str, Any],
+    *,
+    work_outfit: str,
+    appearance: str,
+    traits: list[Any],
+) -> None:
+    """Ensure items are four single garments, not outfit/role names."""
+    items = config.get("images", {}).get("items")
+    if not isinstance(items, list) or len(items) < 4:
+        return
+    character_name = str(config.get("name") or "")
+    trait_texts = [str(t) for t in traits if isinstance(t, str)]
+    candidates = extract_garment_candidates(work_outfit, appearance, *trait_texts)
+
+    slot_patterns = (
+        ("恤", "衫", "衣", "外套", "开衫", "夹克", "背心", "罩衫", "卫衣"),
+        ("裙", "裤"),
+        ("袜", "丝"),
+        ("鞋", "靴", "高跟", "凉鞋", "拖鞋"),
+    )
+
+    def pick_for_slot(index: int) -> str | None:
+        keys = slot_patterns[index]
+        for cand in candidates:
+            if any(key in cand for key in keys):
+                return cand
+        return None
+
+    for index in range(4):
+        entry = items[index]
+        if not isinstance(entry, dict):
+            continue
+        current = str(entry.get("label") or "").strip()
+        cleaned = normalize_item_label(
+            current, slot_index=index, character_name=character_name
+        )
+        if cleaned is not None and _looks_like_garment_phrase(cleaned):
+            entry["label"] = cleaned
+            continue
+        picked = pick_for_slot(index)
+        if picked is not None:
+            entry["label"] = picked
+        elif cleaned is not None:
+            entry["label"] = cleaned
+        else:
+            entry["label"] = DEFAULT_ITEM_LABELS[index]
+        entry["file"] = FIXED_ITEM_FILES[index]
+
+
 Transport = Callable[
     [str, dict[str, str], dict[str, Any], float],
     dict[str, Any],
@@ -601,12 +734,19 @@ def build_profile_text_prompt(card: CardData, skeleton: dict[str, Any]) -> str:
         f"例如 [{palette_example}]；禁止只写颜色字符串数组。"
         "theme.accent / accentSoft 也必须是 #RRGGBB。"
         "seal.letters≤5, cn≤3, en≤12。"
+        "images.items 必须恰好 4 项，且每项 label 是【单件衣物名称】，顺序固定为："
+        f"1){ITEM_SLOT_HINTS[0]}；2){ITEM_SLOT_HINTS[1]}；"
+        f"3){ITEM_SLOT_HINTS[2]}；4){ITEM_SLOT_HINTS[3]}。"
+        "正确示例：[{\"label\":\"白色短袖T恤\"},{\"label\":\"桔红色短裙\"},"
+        "{\"label\":\"肉色丝袜\"},{\"label\":\"白色凉鞋\"}]。"
+        "错误示例（禁止）：严慧雯警官、便装、制服、战斗姿态、整套造型、角色名+场合。"
+        "不要把人物名写进 item label。"
         f"人物中文名：{skeleton['name']}。"
         f"工作装：{card.work_outfit}。"
         f"性格：{card.personality}。"
         f"外貌：{card.appearance}。"
         f"基本信息：{json.dumps(skeleton.get('facts', []), ensure_ascii=False)}。"
-        "bio 用第三人称中文，traits 侧重视觉与工作装。"
+        "bio 用第三人称中文，traits 侧重视觉与默认工作装单件。"
     )
 
 

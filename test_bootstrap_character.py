@@ -281,6 +281,48 @@ class ProfileBuildTests(unittest.TestCase):
             [{"name": "占位", "color": "#F6F1E8"}],
         )
 
+    def test_merge_rejects_outfit_style_item_labels(self):
+        """Item labels must be single garments, not 角色名+警官/便装."""
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        skeleton["_work_outfit"] = (
+            "白色短袖T恤，桔红色短裙，肉色丝袜，白色凉鞋"
+        )
+        skeleton["name"] = "严慧雯"
+        patch = {
+            "nameEn": "Yan Huiwen",
+            "tagline": "活力新人",
+            "seal": {"letters": "YHW", "cn": "慧", "en": "COP"},
+            "theme": {
+                "accent": "#FF4500",
+                "accentSoft": "#FFA07A",
+                "palette": [{"name": "桔红", "color": "#FF4500"}],
+            },
+            "factNote": "note",
+            "bio": "成年女性简介。",
+            "traits": [
+                "白色短袖 T 恤",
+                "桔红色短裙",
+                "白色凉鞋",
+            ],
+            "tags": ["活力"],
+            "images": {
+                "items": [
+                    {"label": "严慧雯警官"},
+                    {"label": "严慧雯便装"},
+                    {"label": "严慧雯制服"},
+                    {"label": "严慧雯战斗姿态"},
+                ]
+            },
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        bootstrap.validate_bootstrap_profile(merged)
+        labels = [item["label"] for item in merged["images"]["items"]]
+        for label in labels:
+            self.assertNotIn("严慧雯", label)
+            self.assertNotRegex(label, r"警官|便装|制服|战斗|姿态")
+        self.assertTrue(any("恤" in label or "T" in label for label in labels))
+        self.assertTrue(any("裙" in label for label in labels))
+
 class ProfileGenerationTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(bootstrap)
