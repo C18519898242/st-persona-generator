@@ -1,0 +1,2019 @@
+# Bootstrap Character Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add `bootstrap_character.py` that turns a character card + `sample/` model photos into a downstream-compatible `profile.json` plus `{name}_头像.png` / `{name}_全身像.png`.
+
+**Architecture:** Single new script imports HTTP/image helpers from `generate_with_gemini`. Locally parse the card and build a fixed `images`/`display` skeleton; call Gemini once for text fields; call Gemini twice for portrait then full-body images (sample refs, optional portrait as extra ref). User reviews, then runs existing `generate_with_gemini.py`.
+
+**Tech Stack:** Python 3.11+, stdlib `unittest`, `urllib`, PIL (`Pillow`), Gemini native `generateContent` API (same as existing).
+
+**Spec:** `docs/superpowers/specs/2026-07-28-bootstrap-character-design.md`
+
+---
+
+## File map
+
+| File | Responsibility |
+|------|----------------|
+| `bootstrap_character.py` | CLI, path resolution, card parse, profile merge/validate, image bootstrap |
+| `test_bootstrap_character.py` | Unit tests with mocked transport |
+| `generate_with_gemini.py` | **Read-only reuse** (import); do not refactor unless a 1-line export is unavoidable |
+| `README.md` | Optional short bootstrap section (Task 8) |
+
+---
+
+### Task 1: Path resolution and sample discovery
+
+**Files:**
+- Create: `bootstrap_character.py`
+- Create: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write failing tests for paths and samples**
+
+Create `test_bootstrap_character.py`:
+
+```python
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from PIL import Image
+
+try:
+    import bootstrap_character as bootstrap
+except ModuleNotFoundError:
+    bootstrap = None
+
+
+def write_png(path: Path, size: tuple[int, int] = (64, 64)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, "#C49A8A").save(path, format="PNG")
+
+
+SAMPLE_CARD = """════════════════════════════════════
+【Name / 角色名】
+测试角色
+
+【Description / 角色描述】
+【基本信息】
+- 姓名：测试角色
+- 年龄：约 24 岁
+- 职业：诊所助理
+
+【外貌】
+黑直中长发。
+常见着装：
+- 工作：白色长款工作外套，内搭雾蓝衬衫，炭灰半身裙，肉色丝袜，银色高跟凉鞋
+
+════════════════════════════════════
+【Personality / 性格】
+利落、俏、会来事。
+"""
+
+
+class PathResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap, "bootstrap_character 模块尚未实现")
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character = "雨彤"
+        self.character_dir = self.root / self.character
+        self.character_dir.mkdir()
+
+    def test_resolve_prefers_plain_card_name(self):
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        (self.character_dir / "人物卡_雨彤.txt").write_text("其他", encoding="utf-8")
+        sample = self.character_dir / "sample"
+        write_png(sample / "b.png")
+        write_png(sample / "a.jpg")
+
+        paths = bootstrap.resolve_paths(self.root, self.character)
+
+        self.assertEqual(paths.card_path.name, "人物卡.txt")
+        self.assertEqual(
+            [p.name for p in paths.sample_images],
+            ["a.jpg", "b.png"],
+        )
+
+    def test_resolve_falls_back_to_character_named_card(self):
+        (self.character_dir / "人物卡_雨彤.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png")
+
+        paths = bootstrap.resolve_paths(self.root, self.character)
+
+        self.assertEqual(paths.card_path.name, "人物卡_雨彤.txt")
+
+    def test_resolve_errors_when_character_dir_missing(self):
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.resolve_paths(self.root, "不存在")
+
+    def test_resolve_errors_when_no_card(self):
+        write_png(self.character_dir / "sample" / "ref.png")
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "人物卡"):
+            bootstrap.resolve_paths(self.root, self.character)
+
+    def test_resolve_errors_when_sample_empty(self):
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        (self.character_dir / "sample").mkdir()
+        with self.assertRaisesRegex(bootstrap.BootstrapError, "sample"):
+            bootstrap.resolve_paths(self.root, self.character)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: Run tests — expect fail**
+
+Run:
+
+```bash
+python -m unittest test_bootstrap_character.PathResolutionTests -v
+```
+
+Expected: fail with `ModuleNotFoundError` or missing attributes.
+
+- [ ] **Step 3: Minimal implementation**
+
+Create `bootstrap_character.py`:
+
+```python
+#!/usr/bin/env python3
+"""从人物卡与 sample 参考图生成 profile.json、头像与全身像（第一阶段）。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+import generate_with_gemini as gemini
+
+
+class BootstrapError(RuntimeError):
+    """Bootstrap 配置或生成失败。"""
+
+
+SAMPLE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+@dataclass(frozen=True)
+class ResolvedPaths:
+    root: Path
+    character: str
+    character_dir: Path
+    card_path: Path
+    sample_dir: Path
+    sample_images: tuple[Path, ...]
+
+
+def resolve_paths(root: Path, character: str) -> ResolvedPaths:
+    character_dir = Path(root).resolve() / character
+    if not character_dir.is_dir():
+        raise BootstrapError(f"人物目录不存在：{character_dir}")
+
+    plain = character_dir / "人物卡.txt"
+    named = character_dir / f"人物卡_{character}.txt"
+    if plain.is_file():
+        card_path = plain
+    elif named.is_file():
+        card_path = named
+    else:
+        raise BootstrapError(
+            f"找不到人物卡，期望以下之一：\n- {plain}\n- {named}"
+        )
+
+    sample_dir = character_dir / "sample"
+    if not sample_dir.is_dir():
+        raise BootstrapError(f"找不到 sample 目录：{sample_dir}")
+
+    samples = sorted(
+        (
+            path
+            for path in sample_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in SAMPLE_SUFFIXES
+        ),
+        key=lambda path: path.name.lower(),
+    )
+    if not samples:
+        raise BootstrapError(
+            f"sample 目录中没有 jpg/png 参考图：{sample_dir}"
+        )
+
+    return ResolvedPaths(
+        root=Path(root).resolve(),
+        character=character,
+        character_dir=character_dir,
+        card_path=card_path,
+        sample_dir=sample_dir,
+        sample_images=tuple(samples),
+    )
+```
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.PathResolutionTests -v
+```
+
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: resolve bootstrap card and sample image paths"
+```
+
+---
+
+### Task 2: Parse character card
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write failing parse tests**
+
+Append to `test_bootstrap_character.py`:
+
+```python
+class CardParseTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+
+    def test_parse_extracts_name_work_outfit_and_basics(self):
+        card = bootstrap.parse_character_card(SAMPLE_CARD)
+
+        self.assertEqual(card.name, "测试角色")
+        self.assertIn("工作外套", card.work_outfit)
+        self.assertIn("姓名", " ".join(f"{k}{v}" for k, v in card.basic_facts))
+        self.assertTrue(any("24" in v for _, v in card.basic_facts))
+        self.assertIn("利落", card.personality)
+
+    def test_parse_empty_name_allowed(self):
+        card = bootstrap.parse_character_card("【Personality / 性格】\n开朗\n")
+        self.assertEqual(card.name, "")
+        self.assertIn("开朗", card.personality)
+```
+
+- [ ] **Step 2: Run tests — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.CardParseTests -v
+```
+
+Expected: `parse_character_card` missing.
+
+- [ ] **Step 3: Implement parser**
+
+Add to `bootstrap_character.py`:
+
+```python
+@dataclass(frozen=True)
+class CardData:
+    name: str
+    raw_text: str
+    basic_facts: tuple[tuple[str, str], ...]
+    appearance: str
+    work_outfit: str
+    personality: str
+    description: str
+
+
+_SECTION_RE = re.compile(
+    r"【\s*([^】]+?)\s*】",
+)
+
+
+def _split_sections(text: str) -> dict[str, str]:
+    matches = list(_SECTION_RE.finditer(text))
+    sections: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        title = match.group(1).strip()
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        # Keep first occurrence; also index by first token before /
+        sections[title] = body
+        head = title.split("/", 1)[0].strip().lower()
+        sections.setdefault(head, body)
+    return sections
+
+
+def _extract_work_outfit(appearance_or_desc: str) -> str:
+    lines = appearance_or_desc.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if "工作" in stripped and ("：" in stripped or ":" in stripped):
+            # same-line value after colon
+            for sep in ("：", ":"):
+                if sep in stripped:
+                    after = stripped.split(sep, 1)[1].strip()
+                    if after and not after.startswith("-"):
+                        return after
+            # following bullet lines until blank or next major bullet category
+            collected: list[str] = []
+            for follow in lines[index + 1 :]:
+                f = follow.strip()
+                if not f:
+                    if collected:
+                        break
+                    continue
+                if f.startswith("-") or f.startswith("·"):
+                    # stop if looks like another category label only
+                    body = f.lstrip("-· ").strip()
+                    if body.startswith("私下") or body.startswith("日常"):
+                        break
+                    if body.startswith("工作"):
+                        continue
+                    collected.append(body)
+                elif collected:
+                    break
+            if collected:
+                return "；".join(collected)
+            return stripped
+    # fallback: first clothing-like sentence
+    for line in lines:
+        if any(key in line for key in ("白大褂", "外套", "衬衫", "着装")):
+            return line.strip()
+    return appearance_or_desc.strip()[:200]
+
+
+def _extract_basic_facts(text: str) -> tuple[tuple[str, str], ...]:
+    facts: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("-· ").strip()
+        if "：" in stripped:
+            label, value = stripped.split("：", 1)
+        elif ":" in stripped:
+            label, value = stripped.split(":", 1)
+        else:
+            continue
+        label, value = label.strip(), value.strip()
+        if label and value and len(label) <= 12:
+            facts.append((label, value))
+    return tuple(facts)
+
+
+def parse_character_card(text: str) -> CardData:
+    sections = _split_sections(text)
+    name_body = sections.get("Name / 角色名") or sections.get("name") or ""
+    name = ""
+    for line in name_body.splitlines():
+        line = line.strip()
+        if line and not line.startswith("═"):
+            name = line
+            break
+
+    description = (
+        sections.get("Description / 角色描述")
+        or sections.get("description")
+        or ""
+    )
+    personality = (
+        sections.get("Personality / 性格")
+        or sections.get("personality")
+        or ""
+    )
+    # appearance may be nested heading inside description
+    appearance = description
+    for key, body in sections.items():
+        if "外貌" in key:
+            appearance = body
+            break
+
+    work_outfit = _extract_work_outfit(appearance)
+    if not work_outfit:
+        work_outfit = _extract_work_outfit(description)
+
+    basic_source = description
+    for key, body in sections.items():
+        if "基本信息" in key:
+            basic_source = body
+            break
+    basic_facts = _extract_basic_facts(basic_source)
+
+    return CardData(
+        name=name.strip(),
+        raw_text=text,
+        basic_facts=basic_facts,
+        appearance=appearance.strip(),
+        work_outfit=work_outfit.strip(),
+        personality=personality.strip(),
+        description=description.strip(),
+    )
+```
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.CardParseTests -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: parse character card sections for bootstrap"
+```
+
+---
+
+### Task 3: Profile skeleton, merge, validate
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write failing validation/merge tests**
+
+```python
+class ProfileBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.card = bootstrap.parse_character_card(SAMPLE_CARD)
+
+    def test_skeleton_has_fixed_image_files(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+
+        self.assertEqual(skeleton["schemaVersion"], 1)
+        self.assertEqual(skeleton["name"], "测试角色")
+        self.assertEqual(skeleton["assetDir"], "assets_简介")
+        files = [item["file"] for item in skeleton["images"]["views"]]
+        self.assertEqual(
+            files,
+            ["view_front.jpg", "view_side.jpg", "view_back.jpg"],
+        )
+        exp = [item["file"] for item in skeleton["images"]["expressions"]]
+        self.assertEqual(
+            exp,
+            [
+                "exp_calm.jpg",
+                "exp_smile.jpg",
+                "exp_serious.jpg",
+                "exp_surprise.jpg",
+                "exp_think.jpg",
+                "exp_shy.jpg",
+            ],
+        )
+        items = [item["file"] for item in skeleton["images"]["items"]]
+        self.assertEqual(
+            items,
+            [
+                "item_blouse.jpg",
+                "item_skirt.jpg",
+                "item_hose.jpg",
+                "item_shoes.jpg",
+            ],
+        )
+
+    def test_merge_ignores_model_file_overrides(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "雾蓝", "color": "#7FA3B8"}],
+            },
+            "factNote": "补充",
+            "bio": "简介正文成年女性。",
+            "traits": ["黑直发", "白大褂"],
+            "tags": ["利落"],
+            "images": {
+                "views": [{"label": "X", "file": "hack.jpg"}],
+                "items": [
+                    {"label": "雾蓝衬衫", "file": "nope.jpg"},
+                    {"label": "半身裙", "file": "nope.jpg"},
+                    {"label": "丝袜", "file": "nope.jpg"},
+                    {"label": "高跟鞋", "file": "nope.jpg"},
+                ],
+            },
+            "display": {"frontScale": 9.0},
+            "schemaVersion": 99,
+            "assetDir": "evil",
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        bootstrap.validate_bootstrap_profile(merged)
+
+        self.assertEqual(merged["schemaVersion"], 1)
+        self.assertEqual(merged["assetDir"], "assets_简介")
+        self.assertEqual(merged["images"]["views"][0]["file"], "view_front.jpg")
+        self.assertEqual(merged["images"]["items"][0]["label"], "雾蓝衬衫")
+        self.assertEqual(merged["images"]["items"][0]["file"], "item_blouse.jpg")
+        self.assertEqual(merged["display"]["frontScale"], 1.04)
+
+    def test_validate_rejects_bad_color(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        skeleton["nameEn"] = "X"
+        skeleton["tagline"] = "t"
+        skeleton["seal"] = {"letters": "A", "cn": "测", "en": "A"}
+        skeleton["theme"] = {
+            "accent": "red",
+            "accentSoft": "#FFFFFF",
+            "palette": [{"name": "白", "color": "#FFFFFF"}],
+        }
+        skeleton["factNote"] = "n"
+        skeleton["bio"] = "b"
+        skeleton["traits"] = ["t"]
+        skeleton["tags"] = ["g"]
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_bootstrap_profile(skeleton)
+```
+
+- [ ] **Step 2: Run — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.ProfileBuildTests -v
+```
+
+- [ ] **Step 3: Implement skeleton, merge, validate**
+
+Add constants and functions (align file lists with `gemini.EXPECTED_ASSETS`):
+
+```python
+COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+POSITION_RE = re.compile(r"[A-Za-z0-9.%\s-]+")
+
+DEFAULT_DISPLAY = {
+    "frontScale": 1.04,
+    "sideScale": 1.04,
+    "backScale": 1.04,
+    "expressionAspect": 0.7,
+    "expressionPosition": "center 22%",
+}
+
+FIXED_VIEWS = [
+    {"label": "正面", "file": "view_front.jpg", "className": "focus-front"},
+    {"label": "侧面", "file": "view_side.jpg", "className": "focus-side"},
+    {"label": "背面", "file": "view_back.jpg", "className": "focus-back"},
+]
+FIXED_EXPRESSIONS = [
+    {"label": "平静", "file": "exp_calm.jpg"},
+    {"label": "微笑", "file": "exp_smile.jpg"},
+    {"label": "认真", "file": "exp_serious.jpg"},
+    {"label": "惊讶", "file": "exp_surprise.jpg"},
+    {"label": "思考", "file": "exp_think.jpg"},
+    {"label": "羞涩", "file": "exp_shy.jpg"},
+]
+FIXED_ITEM_FILES = [
+    "item_blouse.jpg",
+    "item_skirt.jpg",
+    "item_hose.jpg",
+    "item_shoes.jpg",
+]
+DEFAULT_ITEM_LABELS = ["上装", "下装", "丝袜", "鞋子"]
+
+
+def build_profile_skeleton(card: CardData, *, fallback_name: str) -> dict[str, Any]:
+    name = card.name.strip() or fallback_name.strip()
+    facts: list[dict[str, str]] = [
+        {"label": label, "value": value} for label, value in card.basic_facts
+    ]
+    if not facts:
+        facts = [{"label": "姓名", "value": name}]
+    return {
+        "schemaVersion": 1,
+        "name": name,
+        "nameEn": "",
+        "tagline": "",
+        "seal": {"letters": "", "cn": "", "en": ""},
+        "assetDir": "assets_简介",
+        "theme": {
+            "accent": "#5B8FA8",
+            "accentSoft": "#A8C4D4",
+            "palette": [{"name": "占位", "color": "#F6F1E8"}],
+        },
+        "facts": facts,
+        "factNote": "",
+        "bio": "",
+        "traits": [],
+        "tags": [],
+        "images": {
+            "views": [dict(item) for item in FIXED_VIEWS],
+            "expressions": [dict(item) for item in FIXED_EXPRESSIONS],
+            "items": [
+                {"label": label, "file": filename}
+                for label, filename in zip(DEFAULT_ITEM_LABELS, FIXED_ITEM_FILES)
+            ],
+            "details": [
+                {"label": "面部与发型", "file": "exp_calm.jpg"},
+                {
+                    "label": "职业装侧影",
+                    "file": "view_side.jpg",
+                    "className": "focus-full",
+                },
+            ],
+        },
+        "display": dict(DEFAULT_DISPLAY),
+        "_work_outfit": card.work_outfit,
+        "_personality": card.personality,
+        "_appearance": card.appearance,
+    }
+
+
+def merge_profile(
+    skeleton: dict[str, Any],
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    merged = json.loads(json.dumps(skeleton, ensure_ascii=False))
+    # strip internal keys from output later; keep during fill
+    for key in (
+        "nameEn",
+        "tagline",
+        "factNote",
+        "bio",
+        "traits",
+        "tags",
+    ):
+        if key in patch:
+            merged[key] = patch[key]
+    if isinstance(patch.get("seal"), dict):
+        for key in ("letters", "cn", "en"):
+            if key in patch["seal"]:
+                merged["seal"][key] = patch["seal"][key]
+    if isinstance(patch.get("theme"), dict):
+        theme = patch["theme"]
+        for key in ("accent", "accentSoft"):
+            if key in theme:
+                merged["theme"][key] = theme[key]
+        if isinstance(theme.get("palette"), list) and theme["palette"]:
+            merged["theme"]["palette"] = theme["palette"]
+    if isinstance(patch.get("facts"), list) and patch["facts"]:
+        # allow value polish only if list of {label,value}
+        polished: list[dict[str, str]] = []
+        for item in patch["facts"]:
+            if isinstance(item, dict) and item.get("label") and item.get("value"):
+                polished.append(
+                    {"label": str(item["label"]), "value": str(item["value"])}
+                )
+        if polished:
+            merged["facts"] = polished
+    if isinstance(patch.get("images"), dict):
+        items = patch["images"].get("items")
+        if isinstance(items, list):
+            for index, filename in enumerate(FIXED_ITEM_FILES):
+                if index < len(items) and isinstance(items[index], dict):
+                    label = items[index].get("label")
+                    if isinstance(label, str) and label.strip():
+                        merged["images"]["items"][index]["label"] = label.strip()
+                merged["images"]["items"][index]["file"] = filename
+    # re-apply locks
+    merged["schemaVersion"] = 1
+    merged["assetDir"] = "assets_简介"
+    merged["images"]["views"] = [dict(item) for item in FIXED_VIEWS]
+    merged["images"]["expressions"] = [dict(item) for item in FIXED_EXPRESSIONS]
+    merged["images"]["details"] = [
+        {"label": "面部与发型", "file": "exp_calm.jpg"},
+        {
+            "label": "职业装侧影",
+            "file": "view_side.jpg",
+            "className": "focus-full",
+        },
+    ]
+    for index, filename in enumerate(FIXED_ITEM_FILES):
+        merged["images"]["items"][index]["file"] = filename
+    merged["display"] = dict(DEFAULT_DISPLAY)
+    return merged
+
+
+def _require_str(mapping: dict[str, Any], key: str, where: str) -> str:
+    if key not in mapping or not isinstance(mapping[key], str) or not mapping[key].strip():
+        raise BootstrapError(f"{where}.{key} 必须是非空字符串")
+    return mapping[key]
+
+
+def validate_bootstrap_profile(config: dict[str, Any]) -> None:
+    if config.get("schemaVersion") != 1:
+        raise BootstrapError("schemaVersion 必须为 1")
+    for key in ("name", "nameEn", "tagline", "assetDir", "factNote", "bio"):
+        _require_str(config, key, "profile")
+    seal = config.get("seal")
+    if not isinstance(seal, dict):
+        raise BootstrapError("seal 必须是对象")
+    for key in ("letters", "cn", "en"):
+        _require_str(seal, key, "seal")
+    if len(seal["letters"]) > 5 or len(seal["cn"]) > 3 or len(seal["en"]) > 12:
+        raise BootstrapError("seal 字段长度超出限制")
+    theme = config.get("theme")
+    if not isinstance(theme, dict):
+        raise BootstrapError("theme 必须是对象")
+    for key in ("accent", "accentSoft"):
+        color = _require_str(theme, key, "theme")
+        if not COLOR_RE.fullmatch(color):
+            raise BootstrapError(f"theme.{key} 必须是 #RRGGBB")
+    palette = theme.get("palette")
+    if not isinstance(palette, list) or not palette or len(palette) > 6:
+        raise BootstrapError("theme.palette 需要 1–6 项")
+    for index, swatch in enumerate(palette):
+        if not isinstance(swatch, dict):
+            raise BootstrapError(f"palette[{index}] 无效")
+        _require_str(swatch, "name", f"palette[{index}]")
+        color = _require_str(swatch, "color", f"palette[{index}]")
+        if not COLOR_RE.fullmatch(color):
+            raise BootstrapError(f"palette[{index}].color 必须是 #RRGGBB")
+    facts = config.get("facts")
+    if not isinstance(facts, list) or not facts:
+        raise BootstrapError("facts 至少一项")
+    for index, fact in enumerate(facts):
+        if not isinstance(fact, dict):
+            raise BootstrapError(f"facts[{index}] 无效")
+        _require_str(fact, "label", f"facts[{index}]")
+        _require_str(fact, "value", f"facts[{index}]")
+    for key in ("traits", "tags"):
+        values = config.get(key)
+        if not isinstance(values, list) or not values:
+            raise BootstrapError(f"{key} 至少一项")
+        for index, value in enumerate(values):
+            if not isinstance(value, str) or not value.strip():
+                raise BootstrapError(f"{key}[{index}] 必须非空字符串")
+    display = config.get("display")
+    if not isinstance(display, dict):
+        raise BootstrapError("display 必须是对象")
+    for key in ("frontScale", "sideScale", "backScale"):
+        number = display.get(key)
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise BootstrapError(f"display.{key} 必须是数字")
+        if not 0.8 <= float(number) <= 1.35:
+            raise BootstrapError(f"display.{key} 超出范围")
+    aspect = display.get("expressionAspect")
+    if isinstance(aspect, bool) or not isinstance(aspect, (int, float)):
+        raise BootstrapError("display.expressionAspect 必须是数字")
+    if not 0.45 <= float(aspect) <= 1.4:
+        raise BootstrapError("display.expressionAspect 超出范围")
+    position = _require_str(display, "expressionPosition", "display")
+    if not POSITION_RE.fullmatch(position):
+        raise BootstrapError("display.expressionPosition 含非法字符")
+
+    images = config.get("images")
+    if not isinstance(images, dict):
+        raise BootstrapError("images 必须是对象")
+    expected = {
+        "views": [name for name, _, _ in gemini.EXPECTED_ASSETS["views"]],
+        "expressions": [name for name, _, _ in gemini.EXPECTED_ASSETS["expressions"]],
+        "items": [name for name, _, _ in gemini.EXPECTED_ASSETS["items"]],
+    }
+    for group, expected_names in expected.items():
+        entries = images.get(group)
+        if not isinstance(entries, list):
+            raise BootstrapError(f"images.{group} 必须是数组")
+        actual = [
+            entry.get("file") if isinstance(entry, dict) else None for entry in entries
+        ]
+        if actual != expected_names:
+            raise BootstrapError(
+                f"images.{group} 文件顺序必须为：{', '.join(expected_names)}"
+            )
+        for entry in entries:
+            if not isinstance(entry.get("label"), str) or not entry["label"].strip():
+                raise BootstrapError(f"images.{group} 存在空 label")
+    details = images.get("details")
+    if not isinstance(details, list) or len(details) < 1:
+        raise BootstrapError("images.details 至少一项")
+
+
+def profile_for_disk(config: dict[str, Any]) -> dict[str, Any]:
+    """Drop internal underscore keys before writing."""
+    return {key: value for key, value in config.items() if not key.startswith("_")}
+```
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.ProfileBuildTests -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: build and validate bootstrap profile.json skeleton"
+```
+
+---
+
+### Task 4: Gemini text completion for profile fields
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write failing tests for text request + ensure_profile_json**
+
+```python
+class ProfileGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png")
+        self.paths = bootstrap.resolve_paths(self.root, "雨彤")
+        self.card = bootstrap.parse_character_card(
+            self.paths.card_path.read_text(encoding="utf-8-sig")
+        )
+        self.valid_patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事的助理",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [
+                    {"name": "暖米白", "color": "#F6F1E8"},
+                    {"name": "雾蓝", "color": "#7FA3B8"},
+                ],
+            },
+            "factNote": "客气里藏着机灵。",
+            "bio": "测试角色是成年女性诊所助理，气质利落。",
+            "traits": ["黑直中长发", "白色工作外套", "雾蓝衬衫"],
+            "tags": ["利落", "俏", "助理感"],
+            "images": {
+                "items": [
+                    {"label": "雾蓝衬衫"},
+                    {"label": "炭灰半身裙"},
+                    {"label": "肉色丝袜"},
+                    {"label": "银色高跟凉鞋"},
+                ]
+            },
+        }
+
+    def test_ensure_profile_writes_json_via_transport(self):
+        calls: list[dict] = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        self.valid_patch, ensure_ascii=False
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+        path = bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(path.is_file())
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["nameEn"], "Test Role")
+        self.assertEqual(data["images"]["items"][0]["file"], "item_blouse.jpg")
+        self.assertEqual(len(calls), 1)
+        # second call skips
+        bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_dry_run_does_not_write(self):
+        def transport(*args, **kwargs):
+            raise AssertionError("dry-run must not call API")
+
+        path = bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=True,
+            transport=transport,
+        )
+        self.assertFalse(path.exists())
+```
+
+- [ ] **Step 2: Run — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.ProfileGenerationTests -v
+```
+
+- [ ] **Step 3: Implement text Gemini helpers and ensure_profile_json**
+
+```python
+Transport = Callable[
+    [str, dict[str, str], dict[str, Any], float],
+    dict[str, Any],
+]
+
+
+def _extract_text(response: dict[str, Any]) -> str:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list):
+        raise gemini.RetryableGenerationError("Gemini 没有返回文本")
+    chunks: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+    text = "\n".join(chunks).strip()
+    if not text:
+        raise gemini.RetryableGenerationError("Gemini 返回空文本")
+    return text
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        # try to locate first {...}
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError as exc2:
+                raise gemini.RetryableGenerationError(
+                    "Gemini 文本不是有效 JSON"
+                ) from exc2
+        else:
+            raise gemini.RetryableGenerationError(
+                "Gemini 文本不是有效 JSON"
+            ) from exc
+    if not isinstance(data, dict):
+        raise gemini.RetryableGenerationError("Gemini JSON 顶层必须是对象")
+    return data
+
+
+def build_profile_text_prompt(card: CardData, skeleton: dict[str, Any]) -> str:
+    return (
+        "你是人物设定资料助手。根据人物卡摘要，输出一个 JSON 对象，不要 Markdown。"
+        "角色为虚构成年女性，完整着装，非露骨。"
+        "字段：nameEn, tagline, seal{letters,cn,en}, theme{accent,accentSoft,palette},"
+        "factNote, bio, traits(数组), tags(数组), images.items(长度4，每项含 label)。"
+        "颜色必须 #RRGGBB。seal.letters≤5, cn≤3, en≤12。"
+        f"人物中文名：{skeleton['name']}。"
+        f"工作装：{card.work_outfit}。"
+        f"性格：{card.personality}。"
+        f"外貌：{card.appearance}。"
+        f"基本信息：{json.dumps(skeleton.get('facts', []), ensure_ascii=False)}。"
+        "bio 用第三人称中文，traits 侧重视觉与工作装。"
+    )
+
+
+def request_profile_patch(
+    *,
+    card: CardData,
+    skeleton: dict[str, Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+    transport: Transport,
+    sleeper: Callable[[float], None] = __import__("time").sleep,
+    timeout: float = 180.0,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    from urllib.parse import quote
+
+    encoded_model = quote(model, safe="-.()")
+    url = f"{base_url.rstrip('/')}/models/{encoded_model}:generateContent"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": build_profile_text_prompt(card, skeleton)}],
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["TEXT"],
+            "temperature": 0.4,
+        },
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = transport(url, headers, payload, timeout)
+            return _parse_json_object(_extract_text(response))
+        except gemini.HttpStatusError as exc:
+            retryable = exc.status == 429 or 500 <= exc.status <= 599
+            if not retryable or attempt == max_attempts:
+                raise
+            last_error = exc
+        except (
+            gemini.RetryableGenerationError,
+            gemini.URLError,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            if attempt == max_attempts:
+                raise
+            last_error = exc
+        sleeper(float(attempt))
+        print(f"重试 profile JSON：第 {attempt + 1}/{max_attempts} 次（{type(last_error).__name__}）")
+    raise BootstrapError("profile JSON 生成失败")
+
+
+def is_valid_profile_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    try:
+        validate_bootstrap_profile(data)
+    except BootstrapError:
+        return False
+    return True
+
+
+def ensure_profile_json(
+    paths: ResolvedPaths,
+    card: CardData,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    overwrite: bool,
+    dry_run: bool,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> Path:
+    import time as time_module
+
+    if sleeper is None:
+        sleeper = time_module.sleep
+    output = paths.character_dir / "profile.json"
+    if not overwrite and is_valid_profile_file(output):
+        print(f"跳过 profile.json：{output}")
+        return output
+    skeleton = build_profile_skeleton(card, fallback_name=paths.character)
+    if dry_run:
+        print(f"[dry-run] 将生成 profile.json → {output}")
+        print(f"[dry-run] name={skeleton['name']}")
+        return output
+    if not api_key.strip():
+        raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
+    print(f"生成 profile.json：{output}")
+    patch = request_profile_patch(
+        card=card,
+        skeleton=skeleton,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        transport=transport,
+        sleeper=sleeper,
+    )
+    merged = merge_profile(skeleton, patch)
+    validate_bootstrap_profile(merged)
+    disk = profile_for_disk(merged)
+    payload = json.dumps(disk, ensure_ascii=False, indent=2) + "\n"
+    gemini.atomic_write(output, payload.encode("utf-8"))
+    if not is_valid_profile_file(output):
+        raise BootstrapError(f"写入后 profile.json 校验失败：{output}")
+    return output
+```
+
+Note: import `URLError` usage — in implementation use `from urllib.error import URLError` or catch via `gemini` if re-exported; prefer:
+
+```python
+from urllib.error import URLError
+```
+
+and catch `URLError` directly (do not use `gemini.URLError` unless exported).
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.ProfileGenerationTests -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: generate profile.json fields via Gemini text API"
+```
+
+---
+
+### Task 5: Portrait / full-body image generation
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write failing image tests**
+
+```python
+import base64
+import io
+
+
+def png_bytes(size: tuple[int, int]) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, "#AABBCC").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def image_response(raw: bytes) -> dict:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(raw).decode("ascii"),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
+class ImageBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png", (128, 128))
+        self.paths = bootstrap.resolve_paths(self.root, "雨彤")
+        # minimal valid profile on disk
+        card = bootstrap.parse_character_card(SAMPLE_CARD)
+        skeleton = bootstrap.build_profile_skeleton(card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "Test Role",
+            "tagline": "tag",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "米", "color": "#F6F1E8"}],
+            },
+            "factNote": "note",
+            "bio": "bio adult",
+            "traits": ["黑发"],
+            "tags": ["利落"],
+            "images": {
+                "items": [
+                    {"label": "衬衫"},
+                    {"label": "裙"},
+                    {"label": "丝袜"},
+                    {"label": "鞋"},
+                ]
+            },
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        (self.character_dir / "profile.json").write_text(
+            json.dumps(bootstrap.profile_for_disk(merged), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.config = merged
+
+    def test_normalize_png_exact_size(self):
+        raw = png_bytes((200, 300))
+        out = bootstrap.normalize_image_png(raw, (896, 1280))
+        with Image.open(io.BytesIO(out)) as image:
+            self.assertEqual(image.size, (896, 1280))
+            self.assertEqual(image.format, "PNG")
+
+    def test_ensure_images_writes_portrait_and_full_body(self):
+        calls = {"n": 0}
+
+        def transport(url, headers, payload, timeout):
+            calls["n"] += 1
+            # return large enough source
+            if calls["n"] == 1:
+                return image_response(png_bytes((896, 1280)))
+            return image_response(png_bytes((1024, 1536)))
+
+        portrait, full_body = bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(portrait.is_file())
+        self.assertTrue(full_body.is_file())
+        with Image.open(portrait) as image:
+            self.assertEqual(image.size, (896, 1280))
+        with Image.open(full_body) as image:
+            self.assertEqual(image.size, (1024, 1536))
+        self.assertEqual(calls["n"], 2)
+
+        # skip on second run
+        bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertEqual(calls["n"], 2)
+
+    def test_legacy_sized_refs_skip_generation(self):
+        name = self.config["name"]
+        write_png(self.character_dir / f"{name}_头像_1.png", (896, 1280))
+        write_png(self.character_dir / f"{name}_全身像_1.png", (1024, 1536))
+
+        def transport(*args, **kwargs):
+            raise AssertionError("should skip when legacy valid refs exist")
+
+        portrait, full_body = bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(str(portrait).endswith("_1.png") or portrait.is_file())
+```
+
+- [ ] **Step 2: Run — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.ImageBootstrapTests -v
+```
+
+- [ ] **Step 3: Implement image helpers**
+
+```python
+import io
+import time
+from urllib.error import URLError
+from urllib.parse import quote
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+PORTRAIT_SIZE = (896, 1280)
+FULL_BODY_SIZE = (1024, 1536)
+PORTRAIT_RATIO = "3:4"
+FULL_BODY_RATIO = "2:3"
+
+
+def normalize_image_png(
+    image_bytes: bytes,
+    target_size: tuple[int, int],
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.load()
+            normalized = ImageOps.fit(
+                source.convert("RGB"),
+                target_size,
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            output = io.BytesIO()
+            normalized.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise gemini.RetryableGenerationError("Gemini 返回的图片无法解码") from exc
+
+
+def is_valid_png(path: Path, target_size: tuple[int, int]) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            image.load()
+            return image.size == target_size
+    except (OSError, UnidentifiedImageError):
+        return False
+
+
+def find_existing_reference(
+    character_dir: Path,
+    name: str,
+    kind: str,
+    target_size: tuple[int, int],
+) -> Path | None:
+    preferred = character_dir / f"{name}_{kind}.png"
+    legacy = character_dir / f"{name}_{kind}_1.png"
+    for path in (preferred, legacy):
+        if is_valid_png(path, target_size):
+            return path
+    return None
+
+
+def encode_reference_resized(path: Path, max_side: int = 2048) -> dict[str, Any]:
+    """Like gemini.encode_reference but downscales large images in memory."""
+    mime_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }
+    mime = mime_types.get(path.suffix.lower())
+    if mime is None:
+        raise BootstrapError(f"不支持的参考图格式：{path}")
+    try:
+        with Image.open(path) as image:
+            image.load()
+            rgb = image.convert("RGB")
+            width, height = rgb.size
+            longest = max(width, height)
+            if longest > max_side:
+                scale = max_side / float(longest)
+                rgb = rgb.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            if path.suffix.lower() == ".png":
+                rgb.save(buf, format="PNG", optimize=True)
+                mime = "image/png"
+            else:
+                rgb.save(buf, format="JPEG", quality=90, optimize=True)
+                mime = "image/jpeg"
+            raw = buf.getvalue()
+    except OSError as exc:
+        raise BootstrapError(f"无法读取参考图 {path}：{exc}") from exc
+    import base64
+
+    return {
+        "inlineData": {
+            "mimeType": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    }
+
+
+def _profile_image_summary(config: dict[str, Any]) -> str:
+    traits = "；".join(str(item) for item in config.get("traits", []))
+    return (
+        f"人物：{config.get('name', '')}。"
+        f"简介：{config.get('bio', '')}。"
+        f"视觉特征：{traits}。"
+        f"工作装：{config.get('_work_outfit', '')}。"
+    )
+
+
+def build_portrait_prompt(config: dict[str, Any]) -> str:
+    return (
+        "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+        + _profile_image_summary(config)
+        + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官、发型与体型。"
+        "生成单张半身肖像：完整头发、头部、双肩和少量上半身，表情自然平静。"
+        "双眼中心约在画面高度 30% 一带。背景干净暖米白，柔和人像光。"
+        "不要文字、标签、边框、拼图、水印、额外人物。"
+        f"目标比例 {PORTRAIT_RATIO}，交付尺寸 {PORTRAIT_SIZE[0]}×{PORTRAIT_SIZE[1]}。"
+        "只输出一张图片。"
+    )
+
+
+def build_full_body_prompt(config: dict[str, Any]) -> str:
+    outfit = config.get("_work_outfit") or "默认职业工作装，完整着装"
+    return (
+        "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+        + _profile_image_summary(config)
+        + "严格保持参考图中的同一人物身份。"
+        f"生成单张标准正面全身立绘，穿着默认工作装：{outfit}。"
+        "自然站立，从头顶到鞋底完整可见，人物约占画面高度 88%，"
+        "背景干净暖米白或简洁室内，不要文字水印拼图额外人物。"
+        f"目标比例 {FULL_BODY_RATIO}，交付尺寸 {FULL_BODY_SIZE[0]}×{FULL_BODY_SIZE[1]}。"
+        "只输出一张图片。"
+    )
+
+
+def request_bootstrap_image(
+    *,
+    prompt: str,
+    reference_paths: Sequence[Path],
+    aspect_ratio: str,
+    target_size: tuple[int, int],
+    api_key: str,
+    base_url: str,
+    model: str,
+    transport: Transport,
+    sleeper: Callable[[float], None] = time.sleep,
+    timeout: float = 180.0,
+    max_attempts: int = 3,
+) -> bytes:
+    url = (
+        f"{base_url.rstrip('/')}/models/"
+        f"{quote(model, safe='-.()')}:generateContent"
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    for path in reference_paths:
+        parts.append(encode_reference_resized(path))
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "aspectRatio": aspect_ratio,
+                "imageSize": "2K",
+            },
+        },
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = transport(url, headers, payload, timeout)
+            image_bytes, _ = gemini.extract_image(response)
+            return normalize_image_png(image_bytes, target_size)
+        except gemini.HttpStatusError as exc:
+            retryable = exc.status == 429 or 500 <= exc.status <= 599
+            if not retryable or attempt == max_attempts:
+                raise
+            last_error = exc
+        except (
+            gemini.RetryableGenerationError,
+            URLError,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            if attempt == max_attempts:
+                raise
+            last_error = exc
+        sleeper(float(attempt))
+        print(
+            f"重试图片：第 {attempt + 1}/{max_attempts} 次"
+            f"（{type(last_error).__name__}）"
+        )
+    raise BootstrapError("图片生成失败")
+
+
+def ensure_reference_images(
+    paths: ResolvedPaths,
+    config: dict[str, Any],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    overwrite: bool,
+    dry_run: bool,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> tuple[Path, Path]:
+    if sleeper is None:
+        sleeper = time.sleep
+    name = config["name"]
+    portrait_out = paths.character_dir / f"{name}_头像.png"
+    full_out = paths.character_dir / f"{name}_全身像.png"
+
+    existing_portrait = None if overwrite else find_existing_reference(
+        paths.character_dir, name, "头像", PORTRAIT_SIZE
+    )
+    existing_full = None if overwrite else find_existing_reference(
+        paths.character_dir, name, "全身像", FULL_BODY_SIZE
+    )
+
+    if dry_run:
+        print(f"[dry-run] 头像 → {portrait_out} ({PORTRAIT_SIZE[0]}x{PORTRAIT_SIZE[1]})")
+        print(f"[dry-run] 全身像 → {full_out} ({FULL_BODY_SIZE[0]}x{FULL_BODY_SIZE[1]})")
+        return portrait_out, full_out
+
+    if not api_key.strip():
+        raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
+
+    # enrich config with work outfit from card if missing
+    if not config.get("_work_outfit"):
+        # try read from disk-only profile: leave empty
+        pass
+
+    if existing_portrait is not None:
+        print(f"跳过头像：{existing_portrait}")
+        portrait_path = existing_portrait
+    else:
+        print(f"生成头像：{portrait_out}")
+        raw = request_bootstrap_image(
+            prompt=build_portrait_prompt(config),
+            reference_paths=paths.sample_images,
+            aspect_ratio=PORTRAIT_RATIO,
+            target_size=PORTRAIT_SIZE,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            transport=transport,
+            sleeper=sleeper,
+        )
+        gemini.atomic_write(portrait_out, raw)
+        if not is_valid_png(portrait_out, PORTRAIT_SIZE):
+            raise BootstrapError(f"头像写入后校验失败：{portrait_out}")
+        portrait_path = portrait_out
+
+    if existing_full is not None:
+        print(f"跳过全身像：{existing_full}")
+        full_path = existing_full
+    else:
+        print(f"生成全身像：{full_out}")
+        refs = list(paths.sample_images)
+        if portrait_path.is_file():
+            refs.append(portrait_path)
+        raw = request_bootstrap_image(
+            prompt=build_full_body_prompt(config),
+            reference_paths=refs,
+            aspect_ratio=FULL_BODY_RATIO,
+            target_size=FULL_BODY_SIZE,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            transport=transport,
+            sleeper=sleeper,
+        )
+        gemini.atomic_write(full_out, raw)
+        if not is_valid_png(full_out, FULL_BODY_SIZE):
+            raise BootstrapError(f"全身像写入后校验失败：{full_out}")
+        full_path = full_out
+
+    return portrait_path, full_path
+```
+
+When loading existing profile for image stage, re-attach `_work_outfit` from card in `run_bootstrap` (Task 6).
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.ImageBootstrapTests -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: bootstrap portrait and full-body reference images"
+```
+
+---
+
+### Task 6: `run_bootstrap` orchestration + downstream smoke
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write orchestration + compatibility tests**
+
+```python
+class RunBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png")
+
+    def test_run_bootstrap_end_to_end_mock(self):
+        state = {"text": 0, "image": 0}
+        valid_patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事的助理",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "暖米白", "color": "#F6F1E8"}],
+            },
+            "factNote": "客气里藏着机灵。",
+            "bio": "测试角色是成年女性诊所助理。",
+            "traits": ["黑直中长发", "白色工作外套"],
+            "tags": ["利落", "助理感"],
+            "images": {
+                "items": [
+                    {"label": "雾蓝衬衫"},
+                    {"label": "炭灰半身裙"},
+                    {"label": "肉色丝袜"},
+                    {"label": "银色高跟凉鞋"},
+                ]
+            },
+        }
+
+        def transport(url, headers, payload, timeout):
+            modalities = (
+                payload.get("generationConfig", {}).get("responseModalities") or []
+            )
+            if "TEXT" in modalities or (
+                isinstance(modalities, list)
+                and any(m == "TEXT" for m in modalities)
+            ):
+                state["text"] += 1
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": json.dumps(
+                                            valid_patch, ensure_ascii=False
+                                        )
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            state["image"] += 1
+            if state["image"] == 1:
+                return image_response(png_bytes((896, 1280)))
+            return image_response(png_bytes((1024, 1536)))
+
+        result = bootstrap.run_bootstrap(
+            root=self.root,
+            character="雨彤",
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(result.profile_path.is_file())
+        self.assertTrue(result.portrait_path.is_file())
+        self.assertTrue(result.full_body_path.is_file())
+
+        # Downstream compatibility
+        import generate_with_gemini as gen
+
+        character = gen.load_character(self.root, "雨彤")
+        tasks = gen.build_tasks(character)
+        self.assertEqual(len(tasks), 13)
+```
+
+- [ ] **Step 2: Run — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.RunBootstrapTests -v
+```
+
+- [ ] **Step 3: Implement `run_bootstrap` + `BootstrapResult`**
+
+```python
+@dataclass(frozen=True)
+class BootstrapResult:
+    profile_path: Path
+    portrait_path: Path
+    full_body_path: Path
+
+
+def load_profile_config(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise BootstrapError(f"profile.json 顶层必须是对象：{path}")
+    validate_bootstrap_profile(data)
+    return data
+
+
+def run_bootstrap(
+    *,
+    root: Path,
+    character: str,
+    api_key: str | None,
+    base_url: str = gemini.DEFAULT_BASE_URL,
+    model: str = gemini.DEFAULT_MODEL,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> BootstrapResult:
+    paths = resolve_paths(root, character)
+    card_text = paths.card_path.read_text(encoding="utf-8-sig")
+    card = parse_character_card(card_text)
+    key = api_key or ""
+
+    profile_path = ensure_profile_json(
+        paths,
+        card,
+        api_key=key,
+        base_url=base_url,
+        model=model,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        transport=transport,
+        sleeper=sleeper,
+    )
+    if dry_run:
+        skeleton = build_profile_skeleton(card, fallback_name=character)
+        config = skeleton
+    else:
+        config = load_profile_config(profile_path)
+    config = dict(config)
+    config["_work_outfit"] = card.work_outfit
+    config["_personality"] = card.personality
+    config["_appearance"] = card.appearance
+
+    portrait_path, full_body_path = ensure_reference_images(
+        paths,
+        config,
+        api_key=key,
+        base_url=base_url,
+        model=model,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        transport=transport,
+        sleeper=sleeper,
+    )
+
+    if not dry_run:
+        # smoke: load_character + build_tasks
+        loaded = gemini.load_character(paths.root, paths.character)
+        tasks = gemini.build_tasks(loaded)
+        print(f"下游可规划 {len(tasks)} 张标准素材。下一步：")
+        print(
+            f'  python generate_with_gemini.py --character {paths.character}'
+        )
+
+    return BootstrapResult(
+        profile_path=profile_path,
+        portrait_path=portrait_path,
+        full_body_path=full_body_path,
+    )
+```
+
+- [ ] **Step 4: Run tests — expect pass**
+
+```bash
+python -m unittest test_bootstrap_character.RunBootstrapTests -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: orchestrate bootstrap run with downstream smoke checks"
+```
+
+---
+
+### Task 7: CLI `main`
+
+**Files:**
+- Modify: `bootstrap_character.py`
+- Modify: `test_bootstrap_character.py`
+
+- [ ] **Step 1: Write CLI test**
+
+```python
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        character_dir = self.root / "雨彤"
+        character_dir.mkdir()
+        (character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(character_dir / "sample" / "ref.png")
+
+    def test_main_dry_run_zero(self):
+        code = bootstrap.main(
+            [
+                "--root",
+                str(self.root),
+                "--character",
+                "雨彤",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(code, 0)
+```
+
+- [ ] **Step 2: Run — expect fail**
+
+```bash
+python -m unittest test_bootstrap_character.CliTests -v
+```
+
+- [ ] **Step 3: Implement parser and main**
+
+```python
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="从人物卡与 sample 参考图生成 profile.json、头像与全身像"
+    )
+    parser.add_argument("--character", required=True, help="人物目录名")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="人物根目录（默认 GEMINI_DEFAULT_ROOT）",
+    )
+    parser.add_argument(
+        "--model",
+        default=gemini.DEFAULT_MODEL,
+        help="Gemini 模型",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=(
+            os.environ.get("GEMINI_BASE_URL")
+            or os.environ.get("GEMINI_BASE_RUL")
+            or gemini.DEFAULT_BASE_URL
+        ),
+        help="Gemini API Base URL",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有有效 profile.json 与参考图",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只显示计划，不访问 API 或写入文件",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        gemini.load_env_file(gemini.DEFAULT_ENV_FILE)
+    except (OSError, gemini.GeneratorError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    root = args.root if args.root is not None else gemini.get_default_root()
+    try:
+        result = run_bootstrap(
+            root=root,
+            character=args.character,
+            api_key=os.environ.get("GEMINI_API_KEY"),
+            base_url=args.base_url,
+            model=args.model,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+    except (OSError, BootstrapError, gemini.GeneratorError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    print(f"profile: {result.profile_path}")
+    print(f"头像: {result.portrait_path}")
+    print(f"全身像: {result.full_body_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+- [ ] **Step 4: Run full unit suite**
+
+```bash
+python -m unittest test_bootstrap_character -v
+python -m unittest test_generate_profiles test_generate_with_gemini -v
+```
+
+Expected: all bootstrap tests PASS; existing suites remain green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bootstrap_character.py test_bootstrap_character.py
+git commit -m "feat: add bootstrap_character CLI entrypoint"
+```
+
+---
+
+### Task 8: README snippet (optional but recommended)
+
+**Files:**
+- Modify: `README.md`
+
+- [ ] **Step 1: Add section after intro / before or after Gemini section**
+
+```markdown
+## 第一阶段：从人物卡 bootstrap
+
+当只有人物卡和模特参考图时，先运行：
+
+```bash
+python bootstrap_character.py --character 雨彤
+```
+
+准备目录（`GEMINI_DEFAULT_ROOT` 下）：
+
+```text
+雨彤/
+├── 人物卡.txt          # 或 人物卡_雨彤.txt
+└── sample/             # 一张或多张模特参考图 jpg/png
+```
+
+生成：
+
+- `profile.json`
+- `{name}_头像.png`（896×1280）
+- `{name}_全身像.png`（1024×1536）
+
+人工检查后进入第二阶段：
+
+```bash
+python generate_with_gemini.py --character 雨彤
+```
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: document bootstrap_character first-stage workflow"
+```
+
+---
+
+## Spec coverage checklist
+
+| Spec requirement | Task |
+|------------------|------|
+| `--character` + `GEMINI_DEFAULT_ROOT` | 7 |
+| 人物卡.txt / 人物卡_{character}.txt | 1 |
+| sample/ discovery | 1 |
+| Card parse + work outfit | 2 |
+| Rule skeleton + fixed images files | 3 |
+| Gemini text patch + merge locks | 3–4 |
+| validate without requiring 13 assets | 3 |
+| Portrait 896×1280 PNG | 5 |
+| Full body 1024×1536 PNG work outfit | 5 |
+| Skip / overwrite | 4–5 |
+| Reuse generate_with_gemini helpers | 4–5 |
+| load_character + build_tasks smoke | 6 |
+| No HTML / no 13 images | all (out of scope) |
+| README | 8 |
+
+## Type / name consistency
+
+- Errors: `BootstrapError`
+- Paths: `ResolvedPaths`, `CardData`, `BootstrapResult`
+- Entry: `run_bootstrap`, `main`, `ensure_profile_json`, `ensure_reference_images`
+- Sizes: `PORTRAIT_SIZE=(896,1280)`, `FULL_BODY_SIZE=(1024,1536)`
+- Transport signature matches `generate_with_gemini.Transport`
+
+## Execution notes
+
+- Prefer TDD order exactly as tasks.
+- Do not call real Gemini in unit tests.
+- After Task 7, optional manual: configure `.env` and run dry-run against a real character folder.
