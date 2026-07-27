@@ -540,6 +540,34 @@ root/
 cd "C:\src\g\persona\被催眠的表妹和老婆\_人物模板"
 ```
 
+## 第一阶段：从人物卡 bootstrap
+
+当只有人物卡和模特参考图时，先运行：
+
+```bash
+python bootstrap_character.py --character 雨彤
+```
+
+准备目录（`GEMINI_DEFAULT_ROOT` 下）：
+
+```text
+雨彤/
+├── 人物卡.txt          # 或 人物卡_雨彤.txt
+└── sample/             # 一张或多张模特参考图 jpg/png
+```
+
+生成：
+
+- `profile.json`
+- `{name}_头像.png`（896×1280）
+- `{name}_全身像.png`（1024×1536）
+
+人工检查后进入第二阶段：
+
+```bash
+python generate_with_gemini.py --character 雨彤
+```
+
 ### 使用 Gemini 生成 13 张图片和人物页面
 
 `generate_with_gemini.py` 会读取人物目录中的 `profile.json`、头像和全身像，
