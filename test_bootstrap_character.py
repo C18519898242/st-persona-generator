@@ -88,5 +88,24 @@ class PathResolutionTests(unittest.TestCase):
             bootstrap.resolve_paths(self.root, self.character)
 
 
+class CardParseTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+
+    def test_parse_extracts_name_work_outfit_and_basics(self):
+        card = bootstrap.parse_character_card(SAMPLE_CARD)
+
+        self.assertEqual(card.name, "测试角色")
+        self.assertIn("工作外套", card.work_outfit)
+        self.assertIn("姓名", " ".join(f"{k}{v}" for k, v in card.basic_facts))
+        self.assertTrue(any("24" in v for _, v in card.basic_facts))
+        self.assertIn("利落", card.personality)
+
+    def test_parse_empty_name_allowed(self):
+        card = bootstrap.parse_character_card("【Personality / 性格】\n开朗\n")
+        self.assertEqual(card.name, "")
+        self.assertIn("开朗", card.personality)
+
+
 if __name__ == "__main__":
     unittest.main()
