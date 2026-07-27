@@ -545,6 +545,11 @@ def request_profile_patch(
     timeout: float = 180.0,
     max_attempts: int = 3,
 ) -> dict[str, Any]:
+    """Request Gemini text patch, merge into skeleton, and validate.
+
+    Retries on transport/JSON failures and on merge/validation failures
+    (invalid model output), up to max_attempts.
+    """
     encoded_model = quote(model, safe="-.()")
     url = f"{base_url.rstrip('/')}/models/{encoded_model}:generateContent"
     headers = {
@@ -567,7 +572,10 @@ def request_profile_patch(
     for attempt in range(1, max_attempts + 1):
         try:
             response = transport(url, headers, payload, timeout)
-            return _parse_json_object(_extract_text(response))
+            patch = _parse_json_object(_extract_text(response))
+            merged = merge_profile(skeleton, patch)
+            validate_bootstrap_profile(merged)
+            return merged
         except gemini.HttpStatusError as exc:
             retryable = exc.status == 429 or 500 <= exc.status <= 599
             if not retryable or attempt == max_attempts:
@@ -575,6 +583,7 @@ def request_profile_patch(
             last_error = exc
         except (
             gemini.RetryableGenerationError,
+            BootstrapError,
             URLError,
             TimeoutError,
             ConnectionError,
@@ -632,7 +641,7 @@ def ensure_profile_json(
     if not api_key.strip():
         raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
     print(f"生成 profile.json：{output}")
-    patch = request_profile_patch(
+    merged = request_profile_patch(
         card=card,
         skeleton=skeleton,
         api_key=api_key,
@@ -641,8 +650,6 @@ def ensure_profile_json(
         transport=transport,
         sleeper=sleeper,
     )
-    merged = merge_profile(skeleton, patch)
-    validate_bootstrap_profile(merged)
     disk = profile_for_disk(merged)
     payload = json.dumps(disk, ensure_ascii=False, indent=2) + "\n"
     gemini.atomic_write(output, payload.encode("utf-8"))
@@ -685,7 +692,7 @@ def is_valid_png(path: Path, target_size: tuple[int, int]) -> bool:
             image.verify()
         with Image.open(path) as image:
             image.load()
-            return image.size == target_size
+            return image.format == "PNG" and image.size == target_size
     except (OSError, UnidentifiedImageError):
         return False
 
@@ -879,10 +886,6 @@ def ensure_reference_images(
         raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
 
     # enrich config with work outfit from card if missing
-    if not config.get("_work_outfit"):
-        # try read from disk-only profile: leave empty
-        pass
-
     if existing_portrait is not None:
         print(f"跳过头像：{existing_portrait}")
         portrait_path = existing_portrait
