@@ -229,6 +229,57 @@ class ProfileBuildTests(unittest.TestCase):
         with self.assertRaises(bootstrap.BootstrapError):
             bootstrap.validate_bootstrap_profile(skeleton)
 
+    def test_merge_normalizes_string_palette(self):
+        """Gemini often returns palette as ["#RRGGBB", ...] instead of objects."""
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "Yan Huiwen",
+            "tagline": "冷静坚韧",
+            "seal": {"letters": "YHW", "cn": "慧", "en": "COP"},
+            "theme": {
+                "accent": "5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": ["#1A1A1A", "#F5F5F5", "AABBCC"],
+            },
+            "factNote": "补充",
+            "bio": "简介正文成年女性。",
+            "traits": ["马尾", "黑色T恤"],
+            "tags": ["冷静", "警服"],
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        bootstrap.validate_bootstrap_profile(merged)
+        self.assertEqual(merged["theme"]["accent"], "#5B8FA8")
+        self.assertEqual(
+            merged["theme"]["palette"],
+            [
+                {"name": "色1", "color": "#1A1A1A"},
+                {"name": "色2", "color": "#F5F5F5"},
+                {"name": "色3", "color": "#AABBCC"},
+            ],
+        )
+
+    def test_merge_keeps_skeleton_palette_when_unusable(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "X",
+            "tagline": "t",
+            "seal": {"letters": "A", "cn": "测", "en": "A"},
+            "theme": {
+                "accent": "#111111",
+                "accentSoft": "#222222",
+                "palette": ["not-a-color", 123, None],
+            },
+            "factNote": "n",
+            "bio": "b",
+            "traits": ["t"],
+            "tags": ["g"],
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        bootstrap.validate_bootstrap_profile(merged)
+        self.assertEqual(
+            merged["theme"]["palette"],
+            [{"name": "占位", "color": "#F6F1E8"}],
+        )
 
 class ProfileGenerationTests(unittest.TestCase):
     def setUp(self):

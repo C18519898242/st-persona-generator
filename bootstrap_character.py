@@ -296,6 +296,64 @@ def build_profile_skeleton(card: CardData, *, fallback_name: str) -> dict[str, A
     }
 
 
+def _normalize_hex_color(value: Any) -> str | None:
+    """Return #RRGGBB or None if value cannot be coerced."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if COLOR_RE.fullmatch(text):
+        return text
+    # tolerate missing leading #
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        return f"#{text}"
+    return None
+
+
+def normalize_palette(raw: Any) -> list[dict[str, str]] | None:
+    """Coerce common Gemini palette shapes into [{name, color}, ...].
+
+    Accepts:
+    - [{name, color}, ...]
+    - ["#RRGGBB", ...] or with optional names as plain strings mixed in
+    - [{color/#/hex: ..., name/label: ...}, ...]
+    Returns None if nothing usable (caller keeps skeleton palette).
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(raw[:6]):
+        if isinstance(item, str):
+            color = _normalize_hex_color(item)
+            if color is None:
+                # plain name without color — skip
+                continue
+            normalized.append({"name": f"色{index + 1}", "color": color})
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = (
+            item.get("name")
+            or item.get("label")
+            or item.get("title")
+            or f"色{index + 1}"
+        )
+        color_raw = (
+            item.get("color")
+            or item.get("hex")
+            or item.get("value")
+            or item.get("#")
+        )
+        color = _normalize_hex_color(color_raw)
+        if color is None:
+            continue
+        if not isinstance(name, str) or not name.strip():
+            name = f"色{index + 1}"
+        normalized.append({"name": str(name).strip(), "color": color})
+    if not normalized:
+        return None
+    return normalized[:6]
+
+
 def merge_profile(
     skeleton: dict[str, Any],
     patch: dict[str, Any],
@@ -320,9 +378,18 @@ def merge_profile(
         theme = patch["theme"]
         for key in ("accent", "accentSoft"):
             if key in theme:
-                merged["theme"][key] = theme[key]
-        if isinstance(theme.get("palette"), list) and theme["palette"]:
-            merged["theme"]["palette"] = theme["palette"]
+                color = _normalize_hex_color(theme[key])
+                merged["theme"][key] = color if color is not None else theme[key]
+        palette = normalize_palette(theme.get("palette"))
+        if palette is not None:
+            merged["theme"]["palette"] = palette
+    # some models put palette at top level
+    top_palette = normalize_palette(patch.get("palette"))
+    if top_palette is not None and (
+        not isinstance(patch.get("theme"), dict)
+        or normalize_palette(patch["theme"].get("palette")) is None
+    ):
+        merged["theme"]["palette"] = top_palette
     if isinstance(patch.get("facts"), list) and patch["facts"]:
         # allow value polish only if list of {label,value}
         polished: list[dict[str, str]] = []
@@ -391,11 +458,14 @@ def validate_bootstrap_profile(config: dict[str, Any]) -> None:
         raise BootstrapError("theme.palette 需要 1–6 项")
     for index, swatch in enumerate(palette):
         if not isinstance(swatch, dict):
-            raise BootstrapError(f"palette[{index}] 无效")
+            raise BootstrapError(
+                f"palette[{index}] 无效：期望对象 {{name, color}}，"
+                f"实际为 {type(swatch).__name__}: {swatch!r}"
+            )
         _require_str(swatch, "name", f"palette[{index}]")
         color = _require_str(swatch, "color", f"palette[{index}]")
         if not COLOR_RE.fullmatch(color):
-            raise BootstrapError(f"palette[{index}].color 必须是 #RRGGBB")
+            raise BootstrapError(f"palette[{index}].color 必须是 #RRGGBB，实际为 {color!r}")
     facts = config.get("facts")
     if not isinstance(facts, list) or not facts:
         raise BootstrapError("facts 至少一项")
@@ -518,12 +588,19 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 def build_profile_text_prompt(card: CardData, skeleton: dict[str, Any]) -> str:
+    palette_example = (
+        '{"name":"暖米白","color":"#F6F1E8"},'
+        '{"name":"雾蓝","color":"#7FA3B8"}'
+    )
     return (
         "你是人物设定资料助手。根据人物卡摘要，输出一个 JSON 对象，不要 Markdown。"
         "角色为虚构成年女性，完整着装，非露骨。"
         "字段：nameEn, tagline, seal{letters,cn,en}, theme{accent,accentSoft,palette},"
         "factNote, bio, traits(数组), tags(数组), images.items(长度4，每项含 label)。"
-        "颜色必须 #RRGGBB。seal.letters≤5, cn≤3, en≤12。"
+        "theme.palette 必须是对象数组，每项形如 {\"name\":\"中文名\",\"color\":\"#RRGGBB\"}，"
+        f"例如 [{palette_example}]；禁止只写颜色字符串数组。"
+        "theme.accent / accentSoft 也必须是 #RRGGBB。"
+        "seal.letters≤5, cn≤3, en≤12。"
         f"人物中文名：{skeleton['name']}。"
         f"工作装：{card.work_outfit}。"
         f"性格：{card.personality}。"
