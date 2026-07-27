@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.error import URLError
+from urllib.parse import quote
 
 import generate_with_gemini as gemini
 
@@ -449,3 +452,194 @@ def validate_bootstrap_profile(config: dict[str, Any]) -> None:
 def profile_for_disk(config: dict[str, Any]) -> dict[str, Any]:
     """Drop internal underscore keys before writing."""
     return {key: value for key, value in config.items() if not key.startswith("_")}
+
+
+Transport = Callable[
+    [str, dict[str, str], dict[str, Any], float],
+    dict[str, Any],
+]
+
+
+def _extract_text(response: dict[str, Any]) -> str:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list):
+        raise gemini.RetryableGenerationError("Gemini 没有返回文本")
+    chunks: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+    text = "\n".join(chunks).strip()
+    if not text:
+        raise gemini.RetryableGenerationError("Gemini 返回空文本")
+    return text
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        # try to locate first {...}
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(cleaned[start : end + 1])
+            except json.JSONDecodeError as exc2:
+                raise gemini.RetryableGenerationError(
+                    "Gemini 文本不是有效 JSON"
+                ) from exc2
+        else:
+            raise gemini.RetryableGenerationError(
+                "Gemini 文本不是有效 JSON"
+            ) from exc
+    if not isinstance(data, dict):
+        raise gemini.RetryableGenerationError("Gemini JSON 顶层必须是对象")
+    return data
+
+
+def build_profile_text_prompt(card: CardData, skeleton: dict[str, Any]) -> str:
+    return (
+        "你是人物设定资料助手。根据人物卡摘要，输出一个 JSON 对象，不要 Markdown。"
+        "角色为虚构成年女性，完整着装，非露骨。"
+        "字段：nameEn, tagline, seal{letters,cn,en}, theme{accent,accentSoft,palette},"
+        "factNote, bio, traits(数组), tags(数组), images.items(长度4，每项含 label)。"
+        "颜色必须 #RRGGBB。seal.letters≤5, cn≤3, en≤12。"
+        f"人物中文名：{skeleton['name']}。"
+        f"工作装：{card.work_outfit}。"
+        f"性格：{card.personality}。"
+        f"外貌：{card.appearance}。"
+        f"基本信息：{json.dumps(skeleton.get('facts', []), ensure_ascii=False)}。"
+        "bio 用第三人称中文，traits 侧重视觉与工作装。"
+    )
+
+
+def request_profile_patch(
+    *,
+    card: CardData,
+    skeleton: dict[str, Any],
+    api_key: str,
+    base_url: str,
+    model: str,
+    transport: Transport,
+    sleeper: Callable[[float], None] = time.sleep,
+    timeout: float = 180.0,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    encoded_model = quote(model, safe="-.()")
+    url = f"{base_url.rstrip('/')}/models/{encoded_model}:generateContent"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": build_profile_text_prompt(card, skeleton)}],
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["TEXT"],
+            "temperature": 0.4,
+        },
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = transport(url, headers, payload, timeout)
+            return _parse_json_object(_extract_text(response))
+        except gemini.HttpStatusError as exc:
+            retryable = exc.status == 429 or 500 <= exc.status <= 599
+            if not retryable or attempt == max_attempts:
+                raise
+            last_error = exc
+        except (
+            gemini.RetryableGenerationError,
+            URLError,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            if attempt == max_attempts:
+                raise
+            last_error = exc
+        sleeper(float(attempt))
+        print(
+            f"重试 profile JSON：第 {attempt + 1}/{max_attempts} 次"
+            f"（{type(last_error).__name__}）"
+        )
+    raise BootstrapError("profile JSON 生成失败")
+
+
+def is_valid_profile_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    try:
+        validate_bootstrap_profile(data)
+    except BootstrapError:
+        return False
+    return True
+
+
+def ensure_profile_json(
+    paths: ResolvedPaths,
+    card: CardData,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    overwrite: bool,
+    dry_run: bool,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> Path:
+    if sleeper is None:
+        sleeper = time.sleep
+    output = paths.character_dir / "profile.json"
+    if not overwrite and is_valid_profile_file(output):
+        print(f"跳过 profile.json：{output}")
+        return output
+    skeleton = build_profile_skeleton(card, fallback_name=paths.character)
+    if dry_run:
+        print(f"[dry-run] 将生成 profile.json → {output}")
+        print(f"[dry-run] name={skeleton['name']}")
+        return output
+    if not api_key.strip():
+        raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
+    print(f"生成 profile.json：{output}")
+    patch = request_profile_patch(
+        card=card,
+        skeleton=skeleton,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        transport=transport,
+        sleeper=sleeper,
+    )
+    merged = merge_profile(skeleton, patch)
+    validate_bootstrap_profile(merged)
+    disk = profile_for_disk(merged)
+    payload = json.dumps(disk, ensure_ascii=False, indent=2) + "\n"
+    gemini.atomic_write(output, payload.encode("utf-8"))
+    if not is_valid_profile_file(output):
+        raise BootstrapError(f"写入后 profile.json 校验失败：{output}")
+    return output
+

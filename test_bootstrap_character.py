@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -200,6 +201,112 @@ class ProfileBuildTests(unittest.TestCase):
         skeleton["tags"] = ["g"]
         with self.assertRaises(bootstrap.BootstrapError):
             bootstrap.validate_bootstrap_profile(skeleton)
+
+
+class ProfileGenerationTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png")
+        self.paths = bootstrap.resolve_paths(self.root, "雨彤")
+        self.card = bootstrap.parse_character_card(
+            self.paths.card_path.read_text(encoding="utf-8-sig")
+        )
+        self.valid_patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事的助理",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [
+                    {"name": "暖米白", "color": "#F6F1E8"},
+                    {"name": "雾蓝", "color": "#7FA3B8"},
+                ],
+            },
+            "factNote": "客气里藏着机灵。",
+            "bio": "测试角色是成年女性诊所助理，气质利落。",
+            "traits": ["黑直中长发", "白色工作外套", "雾蓝衬衫"],
+            "tags": ["利落", "俏", "助理感"],
+            "images": {
+                "items": [
+                    {"label": "雾蓝衬衫"},
+                    {"label": "炭灰半身裙"},
+                    {"label": "肉色丝袜"},
+                    {"label": "银色高跟凉鞋"},
+                ]
+            },
+        }
+
+    def test_ensure_profile_writes_json_via_transport(self):
+        calls: list[dict] = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        self.valid_patch, ensure_ascii=False
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+        path = bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(path.is_file())
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["nameEn"], "Test Role")
+        self.assertEqual(data["images"]["items"][0]["file"], "item_blouse.jpg")
+        self.assertEqual(len(calls), 1)
+        # second call skips
+        bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertEqual(len(calls), 1)
+
+    def test_dry_run_does_not_write(self):
+        def transport(*args, **kwargs):
+            raise AssertionError("dry-run must not call API")
+
+        path = bootstrap.ensure_profile_json(
+            self.paths,
+            self.card,
+            api_key="test-key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=True,
+            transport=transport,
+        )
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":
