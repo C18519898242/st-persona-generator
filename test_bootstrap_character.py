@@ -448,5 +448,92 @@ class ImageBootstrapTests(unittest.TestCase):
         self.assertTrue(str(portrait).endswith("_1.png") or portrait.is_file())
 
 
+class RunBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png")
+
+    def test_run_bootstrap_end_to_end_mock(self):
+        state = {"text": 0, "image": 0}
+        valid_patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事的助理",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "暖米白", "color": "#F6F1E8"}],
+            },
+            "factNote": "客气里藏着机灵。",
+            "bio": "测试角色是成年女性诊所助理。",
+            "traits": ["黑直中长发", "白色工作外套"],
+            "tags": ["利落", "助理感"],
+            "images": {
+                "items": [
+                    {"label": "雾蓝衬衫"},
+                    {"label": "炭灰半身裙"},
+                    {"label": "肉色丝袜"},
+                    {"label": "银色高跟凉鞋"},
+                ]
+            },
+        }
+
+        def transport(url, headers, payload, timeout):
+            modalities = (
+                payload.get("generationConfig", {}).get("responseModalities") or []
+            )
+            if "TEXT" in modalities or (
+                isinstance(modalities, list)
+                and any(m == "TEXT" for m in modalities)
+            ):
+                state["text"] += 1
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": json.dumps(
+                                            valid_patch, ensure_ascii=False
+                                        )
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            state["image"] += 1
+            if state["image"] == 1:
+                return image_response(png_bytes((896, 1280)))
+            return image_response(png_bytes((1024, 1536)))
+
+        result = bootstrap.run_bootstrap(
+            root=self.root,
+            character="雨彤",
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(result.profile_path.is_file())
+        self.assertTrue(result.portrait_path.is_file())
+        self.assertTrue(result.full_body_path.is_file())
+
+        # Downstream compatibility
+        import generate_with_gemini as gen
+
+        character = gen.load_character(self.root, "雨彤")
+        tasks = gen.build_tasks(character)
+        self.assertEqual(len(tasks), 13)
+
+
 if __name__ == "__main__":
     unittest.main()

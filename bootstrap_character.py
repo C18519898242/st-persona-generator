@@ -927,3 +927,84 @@ def ensure_reference_images(
 
     return portrait_path, full_path
 
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    profile_path: Path
+    portrait_path: Path
+    full_body_path: Path
+
+
+def load_profile_config(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise BootstrapError(f"profile.json 顶层必须是对象：{path}")
+    validate_bootstrap_profile(data)
+    return data
+
+
+def run_bootstrap(
+    *,
+    root: Path,
+    character: str,
+    api_key: str | None,
+    base_url: str = gemini.DEFAULT_BASE_URL,
+    model: str = gemini.DEFAULT_MODEL,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> BootstrapResult:
+    paths = resolve_paths(root, character)
+    card_text = paths.card_path.read_text(encoding="utf-8-sig")
+    card = parse_character_card(card_text)
+    key = api_key or ""
+
+    profile_path = ensure_profile_json(
+        paths,
+        card,
+        api_key=key,
+        base_url=base_url,
+        model=model,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        transport=transport,
+        sleeper=sleeper,
+    )
+    if dry_run:
+        skeleton = build_profile_skeleton(card, fallback_name=character)
+        config = skeleton
+    else:
+        config = load_profile_config(profile_path)
+    config = dict(config)
+    config["_work_outfit"] = card.work_outfit
+    config["_personality"] = card.personality
+    config["_appearance"] = card.appearance
+
+    portrait_path, full_body_path = ensure_reference_images(
+        paths,
+        config,
+        api_key=key,
+        base_url=base_url,
+        model=model,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        transport=transport,
+        sleeper=sleeper,
+    )
+
+    if not dry_run:
+        # smoke: load_character + build_tasks
+        loaded = gemini.load_character(paths.root, paths.character)
+        tasks = gemini.build_tasks(loaded)
+        print(f"下游可规划 {len(tasks)} 张标准素材。下一步：")
+        print(
+            f"  python generate_with_gemini.py --character {paths.character}"
+        )
+
+    return BootstrapResult(
+        profile_path=profile_path,
+        portrait_path=portrait_path,
+        full_body_path=full_body_path,
+    )
+
