@@ -230,8 +230,8 @@ python bootstrap_character.py --character 雨彤
 
 | 产物 | 尺寸 | 请求比例 | 磁盘格式 |
 |------|------|----------|----------|
-| 头像 | 896×1280 | 与表情图一致（实现可用 `3:4` 或文档 7:10；最终 **fit 到精确像素**） | PNG RGB |
-| 全身像 | 1024×1536 | `2:3` | PNG RGB |
+| 头像 | 896×1280 | 请求 `aspectRatio` 与 `EXPECTED_ASSETS` 表情图一致（`3:4`）；落盘前 **fit 到精确 896×1280** | PNG RGB |
+| 全身像 | 1024×1536 | 请求 `2:3`；落盘前 **fit 到精确 1024×1536** | PNG RGB |
 
 规范化：居中 `ImageOps.fit`、LANCZOS、无拉伸；提供 `normalize_image_png`（算法对齐 `normalize_image`，输出 PNG 而非 JPEG）。写盘使用现有 `atomic_write`。
 
