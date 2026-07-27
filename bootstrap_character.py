@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import io
 import json
+import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1007,4 +1010,74 @@ def run_bootstrap(
         portrait_path=portrait_path,
         full_body_path=full_body_path,
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="从人物卡与 sample 参考图生成 profile.json、头像与全身像"
+    )
+    parser.add_argument("--character", required=True, help="人物目录名")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="人物根目录（默认 GEMINI_DEFAULT_ROOT）",
+    )
+    parser.add_argument(
+        "--model",
+        default=gemini.DEFAULT_MODEL,
+        help="Gemini 模型",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=(
+            os.environ.get("GEMINI_BASE_URL")
+            or os.environ.get("GEMINI_BASE_RUL")
+            or gemini.DEFAULT_BASE_URL
+        ),
+        help="Gemini API Base URL",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有有效 profile.json 与参考图",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只显示计划，不访问 API 或写入文件",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        gemini.load_env_file(gemini.DEFAULT_ENV_FILE)
+    except (OSError, gemini.GeneratorError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    root = args.root if args.root is not None else gemini.get_default_root()
+    try:
+        result = run_bootstrap(
+            root=root,
+            character=args.character,
+            api_key=os.environ.get("GEMINI_API_KEY"),
+            base_url=args.base_url,
+            model=args.model,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+    except (OSError, BootstrapError, gemini.GeneratorError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    print(f"profile: {result.profile_path}")
+    print(f"头像: {result.portrait_path}")
+    print(f"全身像: {result.full_body_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 

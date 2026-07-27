@@ -535,5 +535,29 @@ class RunBootstrapTests(unittest.TestCase):
         self.assertEqual(len(tasks), 13)
 
 
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        character_dir = self.root / "雨彤"
+        character_dir.mkdir()
+        (character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(character_dir / "sample" / "ref.png")
+
+    def test_main_dry_run_zero(self):
+        code = bootstrap.main(
+            [
+                "--root",
+                str(self.root),
+                "--character",
+                "雨彤",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
