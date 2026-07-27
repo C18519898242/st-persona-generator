@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import io
 import json
 import tempfile
 import unittest
@@ -17,6 +19,31 @@ except ModuleNotFoundError:
 def write_png(path: Path, size: tuple[int, int] = (64, 64)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, "#C49A8A").save(path, format="PNG")
+
+
+def png_bytes(size: tuple[int, int]) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, "#AABBCC").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def image_response(raw: bytes) -> dict:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(raw).decode("ascii"),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
 
 
 SAMPLE_CARD = """════════════════════════════════════
@@ -307,6 +334,118 @@ class ProfileGenerationTests(unittest.TestCase):
             transport=transport,
         )
         self.assertFalse(path.exists())
+
+
+class ImageBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character_dir = self.root / "雨彤"
+        self.character_dir.mkdir()
+        (self.character_dir / "人物卡.txt").write_text(SAMPLE_CARD, encoding="utf-8")
+        write_png(self.character_dir / "sample" / "ref.png", (128, 128))
+        self.paths = bootstrap.resolve_paths(self.root, "雨彤")
+        # minimal valid profile on disk
+        card = bootstrap.parse_character_card(SAMPLE_CARD)
+        skeleton = bootstrap.build_profile_skeleton(card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "Test Role",
+            "tagline": "tag",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "米", "color": "#F6F1E8"}],
+            },
+            "factNote": "note",
+            "bio": "bio adult",
+            "traits": ["黑发"],
+            "tags": ["利落"],
+            "images": {
+                "items": [
+                    {"label": "衬衫"},
+                    {"label": "裙"},
+                    {"label": "丝袜"},
+                    {"label": "鞋"},
+                ]
+            },
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        (self.character_dir / "profile.json").write_text(
+            json.dumps(bootstrap.profile_for_disk(merged), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.config = merged
+
+    def test_normalize_png_exact_size(self):
+        raw = png_bytes((200, 300))
+        out = bootstrap.normalize_image_png(raw, (896, 1280))
+        with Image.open(io.BytesIO(out)) as image:
+            self.assertEqual(image.size, (896, 1280))
+            self.assertEqual(image.format, "PNG")
+
+    def test_ensure_images_writes_portrait_and_full_body(self):
+        calls = {"n": 0}
+
+        def transport(url, headers, payload, timeout):
+            calls["n"] += 1
+            # return large enough source
+            if calls["n"] == 1:
+                return image_response(png_bytes((896, 1280)))
+            return image_response(png_bytes((1024, 1536)))
+
+        portrait, full_body = bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(portrait.is_file())
+        self.assertTrue(full_body.is_file())
+        with Image.open(portrait) as image:
+            self.assertEqual(image.size, (896, 1280))
+        with Image.open(full_body) as image:
+            self.assertEqual(image.size, (1024, 1536))
+        self.assertEqual(calls["n"], 2)
+
+        # skip on second run
+        bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertEqual(calls["n"], 2)
+
+    def test_legacy_sized_refs_skip_generation(self):
+        name = self.config["name"]
+        write_png(self.character_dir / f"{name}_头像_1.png", (896, 1280))
+        write_png(self.character_dir / f"{name}_全身像_1.png", (1024, 1536))
+
+        def transport(*args, **kwargs):
+            raise AssertionError("should skip when legacy valid refs exist")
+
+        portrait, full_body = bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertTrue(str(portrait).endswith("_1.png") or portrait.is_file())
 
 
 if __name__ == "__main__":

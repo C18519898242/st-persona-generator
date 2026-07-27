@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 from urllib.error import URLError
 from urllib.parse import quote
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 import generate_with_gemini as gemini
 
@@ -642,4 +646,284 @@ def ensure_profile_json(
     if not is_valid_profile_file(output):
         raise BootstrapError(f"写入后 profile.json 校验失败：{output}")
     return output
+
+
+PORTRAIT_SIZE = (896, 1280)
+FULL_BODY_SIZE = (1024, 1536)
+PORTRAIT_RATIO = "3:4"
+FULL_BODY_RATIO = "2:3"
+
+
+def normalize_image_png(
+    image_bytes: bytes,
+    target_size: tuple[int, int],
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.load()
+            normalized = ImageOps.fit(
+                source.convert("RGB"),
+                target_size,
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            output = io.BytesIO()
+            normalized.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise gemini.RetryableGenerationError("Gemini 返回的图片无法解码") from exc
+
+
+def is_valid_png(path: Path, target_size: tuple[int, int]) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            image.load()
+            return image.size == target_size
+    except (OSError, UnidentifiedImageError):
+        return False
+
+
+def find_existing_reference(
+    character_dir: Path,
+    name: str,
+    kind: str,
+    target_size: tuple[int, int],
+) -> Path | None:
+    preferred = character_dir / f"{name}_{kind}.png"
+    legacy = character_dir / f"{name}_{kind}_1.png"
+    for path in (preferred, legacy):
+        if is_valid_png(path, target_size):
+            return path
+    return None
+
+
+def encode_reference_resized(path: Path, max_side: int = 2048) -> dict[str, Any]:
+    """Like gemini.encode_reference but downscales large images in memory."""
+    mime_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+    }
+    mime = mime_types.get(path.suffix.lower())
+    if mime is None:
+        raise BootstrapError(f"不支持的参考图格式：{path}")
+    try:
+        with Image.open(path) as image:
+            image.load()
+            rgb = image.convert("RGB")
+            width, height = rgb.size
+            longest = max(width, height)
+            if longest > max_side:
+                scale = max_side / float(longest)
+                rgb = rgb.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            if path.suffix.lower() == ".png":
+                rgb.save(buf, format="PNG", optimize=True)
+                mime = "image/png"
+            else:
+                rgb.save(buf, format="JPEG", quality=90, optimize=True)
+                mime = "image/jpeg"
+            raw = buf.getvalue()
+    except OSError as exc:
+        raise BootstrapError(f"无法读取参考图 {path}：{exc}") from exc
+
+    return {
+        "inlineData": {
+            "mimeType": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    }
+
+
+def _profile_image_summary(config: dict[str, Any]) -> str:
+    traits = "；".join(str(item) for item in config.get("traits", []))
+    return (
+        f"人物：{config.get('name', '')}。"
+        f"简介：{config.get('bio', '')}。"
+        f"视觉特征：{traits}。"
+        f"工作装：{config.get('_work_outfit', '')}。"
+    )
+
+
+def build_portrait_prompt(config: dict[str, Any]) -> str:
+    return (
+        "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+        + _profile_image_summary(config)
+        + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官、发型与体型。"
+        "生成单张半身肖像：完整头发、头部、双肩和少量上半身，表情自然平静。"
+        "双眼中心约在画面高度 30% 一带。背景干净暖米白，柔和人像光。"
+        "不要文字、标签、边框、拼图、水印、额外人物。"
+        f"目标比例 {PORTRAIT_RATIO}，交付尺寸 {PORTRAIT_SIZE[0]}×{PORTRAIT_SIZE[1]}。"
+        "只输出一张图片。"
+    )
+
+
+def build_full_body_prompt(config: dict[str, Any]) -> str:
+    outfit = config.get("_work_outfit") or "默认职业工作装，完整着装"
+    return (
+        "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+        + _profile_image_summary(config)
+        + "严格保持参考图中的同一人物身份。"
+        f"生成单张标准正面全身立绘，穿着默认工作装：{outfit}。"
+        "自然站立，从头顶到鞋底完整可见，人物约占画面高度 88%，"
+        "背景干净暖米白或简洁室内，不要文字水印拼图额外人物。"
+        f"目标比例 {FULL_BODY_RATIO}，交付尺寸 {FULL_BODY_SIZE[0]}×{FULL_BODY_SIZE[1]}。"
+        "只输出一张图片。"
+    )
+
+
+def request_bootstrap_image(
+    *,
+    prompt: str,
+    reference_paths: Sequence[Path],
+    aspect_ratio: str,
+    target_size: tuple[int, int],
+    api_key: str,
+    base_url: str,
+    model: str,
+    transport: Transport,
+    sleeper: Callable[[float], None] = time.sleep,
+    timeout: float = 180.0,
+    max_attempts: int = 3,
+) -> bytes:
+    url = (
+        f"{base_url.rstrip('/')}/models/"
+        f"{quote(model, safe='-.()')}:generateContent"
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    for path in reference_paths:
+        parts.append(encode_reference_resized(path))
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "aspectRatio": aspect_ratio,
+                "imageSize": "2K",
+            },
+        },
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = transport(url, headers, payload, timeout)
+            image_bytes, _ = gemini.extract_image(response)
+            return normalize_image_png(image_bytes, target_size)
+        except gemini.HttpStatusError as exc:
+            retryable = exc.status == 429 or 500 <= exc.status <= 599
+            if not retryable or attempt == max_attempts:
+                raise
+            last_error = exc
+        except (
+            gemini.RetryableGenerationError,
+            URLError,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            if attempt == max_attempts:
+                raise
+            last_error = exc
+        sleeper(float(attempt))
+        print(
+            f"重试图片：第 {attempt + 1}/{max_attempts} 次"
+            f"（{type(last_error).__name__}）"
+        )
+    raise BootstrapError("图片生成失败")
+
+
+def ensure_reference_images(
+    paths: ResolvedPaths,
+    config: dict[str, Any],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    overwrite: bool,
+    dry_run: bool,
+    transport: Transport = gemini.http_post_json,
+    sleeper: Callable[[float], None] | None = None,
+) -> tuple[Path, Path]:
+    if sleeper is None:
+        sleeper = time.sleep
+    name = config["name"]
+    portrait_out = paths.character_dir / f"{name}_头像.png"
+    full_out = paths.character_dir / f"{name}_全身像.png"
+
+    existing_portrait = None if overwrite else find_existing_reference(
+        paths.character_dir, name, "头像", PORTRAIT_SIZE
+    )
+    existing_full = None if overwrite else find_existing_reference(
+        paths.character_dir, name, "全身像", FULL_BODY_SIZE
+    )
+
+    if dry_run:
+        print(f"[dry-run] 头像 → {portrait_out} ({PORTRAIT_SIZE[0]}x{PORTRAIT_SIZE[1]})")
+        print(f"[dry-run] 全身像 → {full_out} ({FULL_BODY_SIZE[0]}x{FULL_BODY_SIZE[1]})")
+        return portrait_out, full_out
+
+    if not api_key.strip():
+        raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
+
+    # enrich config with work outfit from card if missing
+    if not config.get("_work_outfit"):
+        # try read from disk-only profile: leave empty
+        pass
+
+    if existing_portrait is not None:
+        print(f"跳过头像：{existing_portrait}")
+        portrait_path = existing_portrait
+    else:
+        print(f"生成头像：{portrait_out}")
+        raw = request_bootstrap_image(
+            prompt=build_portrait_prompt(config),
+            reference_paths=paths.sample_images,
+            aspect_ratio=PORTRAIT_RATIO,
+            target_size=PORTRAIT_SIZE,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            transport=transport,
+            sleeper=sleeper,
+        )
+        gemini.atomic_write(portrait_out, raw)
+        if not is_valid_png(portrait_out, PORTRAIT_SIZE):
+            raise BootstrapError(f"头像写入后校验失败：{portrait_out}")
+        portrait_path = portrait_out
+
+    if existing_full is not None:
+        print(f"跳过全身像：{existing_full}")
+        full_path = existing_full
+    else:
+        print(f"生成全身像：{full_out}")
+        refs = list(paths.sample_images)
+        if portrait_path.is_file():
+            refs.append(portrait_path)
+        raw = request_bootstrap_image(
+            prompt=build_full_body_prompt(config),
+            reference_paths=refs,
+            aspect_ratio=FULL_BODY_RATIO,
+            target_size=FULL_BODY_SIZE,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            transport=transport,
+            sleeper=sleeper,
+        )
+        gemini.atomic_write(full_out, raw)
+        if not is_valid_png(full_out, FULL_BODY_SIZE):
+            raise BootstrapError(f"全身像写入后校验失败：{full_out}")
+        full_path = full_out
+
+    return portrait_path, full_path
 
