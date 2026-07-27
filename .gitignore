@@ -36,3 +36,7 @@ desktop.ini
 *.log
 dist/
 build/
+
+# Git worktrees
+.worktrees/
+
