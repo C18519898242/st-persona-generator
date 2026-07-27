@@ -107,5 +107,100 @@ class CardParseTests(unittest.TestCase):
         self.assertIn("开朗", card.personality)
 
 
+class ProfileBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(bootstrap)
+        self.card = bootstrap.parse_character_card(SAMPLE_CARD)
+
+    def test_skeleton_has_fixed_image_files(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+
+        self.assertEqual(skeleton["schemaVersion"], 1)
+        self.assertEqual(skeleton["name"], "测试角色")
+        self.assertEqual(skeleton["assetDir"], "assets_简介")
+        files = [item["file"] for item in skeleton["images"]["views"]]
+        self.assertEqual(
+            files,
+            ["view_front.jpg", "view_side.jpg", "view_back.jpg"],
+        )
+        exp = [item["file"] for item in skeleton["images"]["expressions"]]
+        self.assertEqual(
+            exp,
+            [
+                "exp_calm.jpg",
+                "exp_smile.jpg",
+                "exp_serious.jpg",
+                "exp_surprise.jpg",
+                "exp_think.jpg",
+                "exp_shy.jpg",
+            ],
+        )
+        items = [item["file"] for item in skeleton["images"]["items"]]
+        self.assertEqual(
+            items,
+            [
+                "item_blouse.jpg",
+                "item_skirt.jpg",
+                "item_hose.jpg",
+                "item_shoes.jpg",
+            ],
+        )
+
+    def test_merge_ignores_model_file_overrides(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        patch = {
+            "nameEn": "Test Role",
+            "tagline": "利落会来事",
+            "seal": {"letters": "CS", "cn": "测", "en": "TEST"},
+            "theme": {
+                "accent": "#5B8FA8",
+                "accentSoft": "#A8C4D4",
+                "palette": [{"name": "雾蓝", "color": "#7FA3B8"}],
+            },
+            "factNote": "补充",
+            "bio": "简介正文成年女性。",
+            "traits": ["黑直发", "白大褂"],
+            "tags": ["利落"],
+            "images": {
+                "views": [{"label": "X", "file": "hack.jpg"}],
+                "items": [
+                    {"label": "雾蓝衬衫", "file": "nope.jpg"},
+                    {"label": "半身裙", "file": "nope.jpg"},
+                    {"label": "丝袜", "file": "nope.jpg"},
+                    {"label": "高跟鞋", "file": "nope.jpg"},
+                ],
+            },
+            "display": {"frontScale": 9.0},
+            "schemaVersion": 99,
+            "assetDir": "evil",
+        }
+        merged = bootstrap.merge_profile(skeleton, patch)
+        bootstrap.validate_bootstrap_profile(merged)
+
+        self.assertEqual(merged["schemaVersion"], 1)
+        self.assertEqual(merged["assetDir"], "assets_简介")
+        self.assertEqual(merged["images"]["views"][0]["file"], "view_front.jpg")
+        self.assertEqual(merged["images"]["items"][0]["label"], "雾蓝衬衫")
+        self.assertEqual(merged["images"]["items"][0]["file"], "item_blouse.jpg")
+        self.assertEqual(merged["display"]["frontScale"], 1.04)
+
+    def test_validate_rejects_bad_color(self):
+        skeleton = bootstrap.build_profile_skeleton(self.card, fallback_name="雨彤")
+        skeleton["nameEn"] = "X"
+        skeleton["tagline"] = "t"
+        skeleton["seal"] = {"letters": "A", "cn": "测", "en": "A"}
+        skeleton["theme"] = {
+            "accent": "red",
+            "accentSoft": "#FFFFFF",
+            "palette": [{"name": "白", "color": "#FFFFFF"}],
+        }
+        skeleton["factNote"] = "n"
+        skeleton["bio"] = "b"
+        skeleton["traits"] = ["t"]
+        skeleton["tags"] = ["g"]
+        with self.assertRaises(bootstrap.BootstrapError):
+            bootstrap.validate_bootstrap_profile(skeleton)
+
+
 if __name__ == "__main__":
     unittest.main()
