@@ -5,7 +5,9 @@ import io
 import json
 import tempfile
 import unittest
+import base64
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -33,6 +35,31 @@ def write_png(
     path.parent.mkdir(parents=True, exist_ok=True)
     color = (120, 100, 90, 0) if mode == "RGBA" else (120, 100, 90)
     Image.new(mode, size, color).save(path, format="PNG")
+
+
+def png_bytes(
+    size: tuple[int, int] = (1200, 1600),
+    mode: str = "RGBA",
+) -> bytes:
+    output = io.BytesIO()
+    color = (20, 40, 60, 0) if mode == "RGBA" else (20, 40, 60)
+    Image.new(mode, size, color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def image_response(raw: bytes) -> dict:
+    return {
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }]
+            }
+        }]
+    }
 
 
 class LabelContractTests(unittest.TestCase):
@@ -98,3 +125,74 @@ class PathAndValidationTests(unittest.TestCase):
         self.assertTrue(expressions.is_valid_expression_png(valid))
         self.assertFalse(expressions.is_valid_expression_png(wrong_size))
         self.assertFalse(expressions.is_valid_expression_png(no_alpha))
+
+
+class PromptAndRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = {
+            "name": "Test Person",
+            "bio": "Adult psychologist",
+            "traits": ["black medium-length hair", "white camisole"],
+        }
+
+    def test_neutral_prompt_locks_identity_framing_and_transparency(self):
+        prompt = expressions.build_expression_prompt(self.profile, "neutral")
+
+        self.assertIn(expressions.EXPRESSION_DESCRIPTIONS["neutral"], prompt)
+        self.assertIn("第一张参考图", prompt)
+        self.assertIn("第二张参考图", prompt)
+        self.assertIn("上半身半身像", prompt)
+        self.assertIn("透明背景", prompt)
+        self.assertIn("896×1280", prompt)
+
+    def test_non_neutral_prompt_assigns_neutral_reference_and_only_changes_face(self):
+        prompt = expressions.build_expression_prompt(self.profile, "anger")
+
+        self.assertIn(expressions.EXPRESSION_DESCRIPTIONS["anger"], prompt)
+        self.assertIn("第三张参考图", prompt)
+        self.assertIn("neutral.png", prompt)
+        self.assertIn("只改变面部表情", prompt)
+
+    def test_normalize_expression_png_preserves_alpha_and_exact_size(self):
+        result = expressions.normalize_expression_png(png_bytes())
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.format, "PNG")
+            self.assertEqual(image.size, (896, 1280))
+            self.assertIn("A", image.getbands())
+
+    def test_request_expression_image_builds_native_gemini_payload(self):
+        calls = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append((url, headers, payload, timeout))
+            return image_response(png_bytes())
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            portrait = root / "portrait.png"
+            full_body = root / "full.png"
+            write_png(portrait)
+            write_png(full_body)
+            result = expressions.request_expression_image(
+                prompt="test prompt",
+                reference_paths=(portrait, full_body),
+                api_key="secret",
+                base_url="https://example.test/v1beta",
+                model="gemini-test",
+                transport=transport,
+                sleeper=lambda _: None,
+            )
+
+        self.assertEqual(len(calls), 1)
+        url, headers, payload, timeout = calls[0]
+        self.assertTrue(url.endswith("/models/gemini-test:generateContent"))
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+        self.assertEqual(payload["generationConfig"]["responseModalities"], ["IMAGE"])
+        self.assertEqual(
+            payload["generationConfig"]["imageConfig"]["aspectRatio"],
+            "3:4",
+        )
+        self.assertEqual(len(payload["contents"][0]["parts"]), 3)
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (896, 1280))
+            self.assertIn("A", image.getbands())
