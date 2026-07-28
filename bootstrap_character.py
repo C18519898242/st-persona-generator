@@ -36,7 +36,7 @@ DEFAULT_DISPLAY = {
     "sideScale": 1.04,
     "backScale": 1.04,
     "expressionAspect": 0.7,
-    "expressionPosition": "center 30%",
+    "expressionPosition": "center 28%",
 }
 
 FIXED_VIEWS = [
@@ -988,31 +988,63 @@ def _profile_image_summary(config: dict[str, Any]) -> str:
     )
 
 
+# 参考图统一背景：纯摄影棚，禁止 sample 里的客厅/家具带进成片
+STUDIO_BACKGROUND = (
+    "背景必须是专业摄影棚纯净无缝背景纸/背景布，均匀暖米白或浅暖灰，"
+    "柔和均匀人像棚灯，地面与背景融为一体、无明显接缝。"
+    "严禁室内家居场景，严禁椅子、沙发、桌子、书架、绿植、窗、门、墙线装饰、道具、杂物。"
+    "画面中只能有这一个人物，不要文字、标签、边框、拼图、水印、额外人物。"
+)
+
+
 def build_portrait_prompt(config: dict[str, Any]) -> str:
+    """半身像提示词：必须以已生成的全身像为身份与着装锚点。"""
     return (
         "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
         + _profile_image_summary(config)
-        + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官、发型与体型。"
+        + "【参考图优先顺序】第一张是已生成的全身立绘（身份+服装锚点），"
+        "其后如有 sample 仅作辅助；若冲突，一律以全身立绘为准。"
         "生成单张人物半身像参考图，表情自然平静。"
+        "必须是全身立绘中的同一个人：脸型、五官、发型、发色、肤色、年龄感完全一致。"
+        "上装必须与全身立绘一致（领型、颜色、外套有无、材质），禁止另起一套衣服或换装。"
         + gemini.HEADSHOT_FRAMING
-        + "上装颜色与版型尽量贴近默认工作装或不与之冲突。"
-        "背景干净暖米白，柔和人像光。"
-        "不要文字、标签、边框、拼图、水印、额外人物。"
-        f"目标比例 {PORTRAIT_RATIO}，交付尺寸 {PORTRAIT_SIZE[0]}×{PORTRAIT_SIZE[1]}。"
+        + STUDIO_BACKGROUND
+        + f"目标比例 {PORTRAIT_RATIO}，交付尺寸 {PORTRAIT_SIZE[0]}×{PORTRAIT_SIZE[1]}。"
         "只输出一张图片。"
     )
 
 
 def build_full_body_prompt(config: dict[str, Any]) -> str:
-    outfit = config.get("_work_outfit") or "默认职业工作装，完整着装"
+    # 优先用 images.items 四单品，保证与服装拆解一致；否则退回人物卡工作装摘要
+    item_labels: list[str] = []
+    images = config.get("images")
+    if isinstance(images, dict):
+        items = images.get("items")
+        if isinstance(items, list):
+            for entry in items:
+                if isinstance(entry, dict):
+                    label = entry.get("label")
+                    if isinstance(label, str) and label.strip():
+                        item_labels.append(label.strip())
+    if item_labels:
+        outfit = "、".join(item_labels)
+        outfit_rule = (
+            f"必须完整穿着以下单品构成的工作装：{outfit}。"
+            "不得改成与单品列表冲突的套装（例如单品是半身裙时禁止西装长裤）。"
+        )
+    else:
+        outfit = config.get("_work_outfit") or "默认职业工作装，完整着装"
+        outfit_rule = f"穿着默认工作装：{outfit}。"
     return (
         "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
         + _profile_image_summary(config)
-        + "严格保持参考图中的同一人物身份。"
-        f"生成单张标准正面全身立绘，穿着默认工作装：{outfit}。"
-        "自然站立，从头顶到鞋底完整可见，人物约占画面高度 88%，"
-        "背景干净暖米白或简洁室内，不要文字水印拼图额外人物。"
-        f"目标比例 {FULL_BODY_RATIO}，交付尺寸 {FULL_BODY_SIZE[0]}×{FULL_BODY_SIZE[1]}。"
+        + "严格保持参考图中的同一人物身份；sample 仅作脸与体型参考，"
+        "禁止把 sample 的室内家具、沙发、场景背景带进成片。"
+        f"生成单张标准正面全身立绘，{outfit_rule}"
+        "自然站立，双臂自然下垂，从头顶到鞋底完整可见，人物约占画面高度 88%，"
+        "透视自然，不做动态姿势。"
+        + STUDIO_BACKGROUND
+        + f"目标比例 {FULL_BODY_RATIO}，交付尺寸 {FULL_BODY_SIZE[0]}×{FULL_BODY_SIZE[1]}。"
         "只输出一张图片。"
     )
 
@@ -1096,6 +1128,7 @@ def ensure_reference_images(
     transport: Transport = gemini.http_post_json,
     sleeper: Callable[[float], None] | None = None,
 ) -> tuple[Path, Path]:
+    """先全身像，再半身像（半身以全身为身份/着装锚点）。返回 (头像路径, 全身路径)。"""
     if sleeper is None:
         sleeper = time.sleep
     name = config["name"]
@@ -1110,46 +1143,27 @@ def ensure_reference_images(
     )
 
     if dry_run:
-        print(f"[dry-run] 头像 → {portrait_out} ({PORTRAIT_SIZE[0]}x{PORTRAIT_SIZE[1]})")
-        print(f"[dry-run] 全身像 → {full_out} ({FULL_BODY_SIZE[0]}x{FULL_BODY_SIZE[1]})")
+        print(
+            f"[dry-run] 全身像 → {full_out} ({FULL_BODY_SIZE[0]}x{FULL_BODY_SIZE[1]})"
+        )
+        print(
+            f"[dry-run] 头像(半身,锚全身) → {portrait_out} "
+            f"({PORTRAIT_SIZE[0]}x{PORTRAIT_SIZE[1]})"
+        )
         return portrait_out, full_out
 
     if not api_key.strip():
         raise BootstrapError("缺少环境变量 GEMINI_API_KEY")
 
-    # enrich config with work outfit from card if missing
-    if existing_portrait is not None:
-        print(f"跳过头像：{existing_portrait}")
-        portrait_path = existing_portrait
-    else:
-        print(f"生成头像：{portrait_out}")
-        raw = request_bootstrap_image(
-            prompt=build_portrait_prompt(config),
-            reference_paths=paths.sample_images,
-            aspect_ratio=PORTRAIT_RATIO,
-            target_size=PORTRAIT_SIZE,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            transport=transport,
-            sleeper=sleeper,
-        )
-        gemini.atomic_write(portrait_out, raw)
-        if not is_valid_png(portrait_out, PORTRAIT_SIZE):
-            raise BootstrapError(f"头像写入后校验失败：{portrait_out}")
-        portrait_path = portrait_out
-
+    # 1) 全身像：sample 定身份 + items/工作装定衣服
     if existing_full is not None:
         print(f"跳过全身像：{existing_full}")
         full_path = existing_full
     else:
         print(f"生成全身像：{full_out}")
-        refs = list(paths.sample_images)
-        if portrait_path.is_file():
-            refs.append(portrait_path)
         raw = request_bootstrap_image(
             prompt=build_full_body_prompt(config),
-            reference_paths=refs,
+            reference_paths=list(paths.sample_images),
             aspect_ratio=FULL_BODY_RATIO,
             target_size=FULL_BODY_SIZE,
             api_key=api_key,
@@ -1162,6 +1176,34 @@ def ensure_reference_images(
         if not is_valid_png(full_out, FULL_BODY_SIZE):
             raise BootstrapError(f"全身像写入后校验失败：{full_out}")
         full_path = full_out
+
+    # 2) 半身头像：必须以全身像为第一参考，保证同人同装
+    if existing_portrait is not None:
+        print(f"跳过头像：{existing_portrait}")
+        portrait_path = existing_portrait
+    else:
+        if not full_path.is_file():
+            raise BootstrapError(
+                f"生成半身头像前需要有效全身像，未找到：{full_path}"
+            )
+        print(f"生成头像（锚定全身像）：{portrait_out}")
+        # 全身像放第一张，其后 sample 仅辅助
+        portrait_refs = [full_path, *list(paths.sample_images)]
+        raw = request_bootstrap_image(
+            prompt=build_portrait_prompt(config),
+            reference_paths=portrait_refs,
+            aspect_ratio=PORTRAIT_RATIO,
+            target_size=PORTRAIT_SIZE,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            transport=transport,
+            sleeper=sleeper,
+        )
+        gemini.atomic_write(portrait_out, raw)
+        if not is_valid_png(portrait_out, PORTRAIT_SIZE):
+            raise BootstrapError(f"头像写入后校验失败：{portrait_out}")
+        portrait_path = portrait_out
 
     return portrait_path, full_path
 

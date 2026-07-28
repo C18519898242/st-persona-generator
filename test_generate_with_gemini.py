@@ -178,8 +178,9 @@ class CharacterPlanningTests(unittest.TestCase):
         self.assertIn("表情编辑", prompts["expression"])
         self.assertIn("仅以参考头像图像为准", prompts["expression"])
         self.assertNotIn("人物简介", prompts["expression"])
-        self.assertIn("上半身半身像", prompts["expression"])
-        self.assertIn("35%–45%", prompts["expression"])
+        self.assertIn("胸上半身像", prompts["expression"])
+        self.assertIn("胸部下方一点点", prompts["expression"])
+        self.assertIn("38%–48%", prompts["expression"])
         self.assertIn("禁止大头特写", prompts["expression"])
         self.assertIn("禁止换人换脸", prompts["expression"])
         self.assertIn("禁止手部遮挡主要五官", prompts["expression"])
@@ -213,6 +214,37 @@ class CharacterPlanningTests(unittest.TestCase):
         self.assertIn("严禁整套穿搭拼贴", prompt)
         self.assertIn("这不是穿在身上的效果图", prompt)
         self.assertIn("只允许出现这一件商品", prompt)
+        self.assertIn("品类以 label 为唯一标准", prompt)
+        self.assertIn("米色开衫", prompt)
+
+    def test_view_prompt_locks_outfit_to_item_labels(self):
+        character = generator.load_character(self.root, "测试人物")
+        task = next(
+            task
+            for task in generator.build_tasks(character)
+            if task.filename == "view_front.jpg"
+        )
+
+        prompt = generator.build_prompt(character, task)
+
+        self.assertIn("着装以 profile 服装拆解单品为准", prompt)
+        self.assertIn("米色开衫", prompt)
+        self.assertIn("短裙", prompt)
+        self.assertIn("以单品列表为准重绘着装", prompt)
+
+    def test_item_skirt_label_forbids_switching_to_trousers(self):
+        character = generator.load_character(self.root, "测试人物")
+        task = next(
+            task
+            for task in generator.build_tasks(character)
+            if task.filename == "item_skirt.jpg"
+        )
+
+        prompt = generator.build_prompt(character, task)
+
+        self.assertIn("短裙", prompt)
+        self.assertIn("禁止生成长裤", prompt)
+        self.assertIn("本张只画其中的“短裙”", prompt)
 
 
 class GeminiClientTests(unittest.TestCase):

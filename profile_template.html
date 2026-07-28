@@ -30,7 +30,9 @@
   .sheet-shell { position: relative; margin: 0 auto; }
   .sheet {
     width: var(--sheet-width);
-    height: var(--sheet-height);
+    /* 内容多时自动加高，不再用死高度裁切说明文字/标签 */
+    height: auto;
+    min-height: var(--sheet-height);
     padding: 48px 56px;
     overflow: hidden;
     position: relative;
@@ -39,7 +41,8 @@
       radial-gradient(circle at 86% 5%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 24%),
       linear-gradient(180deg, #fbf8f2 0%, var(--paper) 56%, #f4eee5 100%);
     display: grid;
-    grid-template-rows: 132px 822px 330px 292px 108px;
+    /* 头图区保持可视高度；资产行/摘要行随内容增高 */
+    grid-template-rows: 132px minmax(780px, auto) auto auto auto;
     gap: 18px;
   }
   .sheet::before, .sheet::after {
@@ -176,7 +179,8 @@
     min-width: 0;
     min-height: 0;
     display: grid;
-    grid-template-rows: minmax(0, 1fr) 27px;
+    /* 说明文字可多行，不再锁死 27px 裁切长 label */
+    grid-template-rows: minmax(0, 1fr) auto;
     gap: 7px;
   }
   .media-frame {
@@ -210,31 +214,42 @@
   figcaption {
     color: #77685d;
     font-family: "Noto Serif SC", "STSong", serif;
-    font-size: 13px;
-    letter-spacing: 0.16em;
+    font-size: 12px;
+    letter-spacing: 0.08em;
     text-align: center;
-    line-height: 27px;
+    line-height: 1.35;
+    min-height: 27px;
+    padding: 0 2px;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
   }
 
   .assets-row {
     display: grid;
     grid-template-columns: 1.1fr 0.9fr 0.82fr;
     gap: 18px;
+    align-items: stretch;
   }
   .assets-row > .panel {
     min-height: 0;
     overflow: hidden;
+    display: grid;
+    grid-template-rows: 54px minmax(200px, auto);
   }
   .asset-grid {
-    height: calc(100% - 54px);
-    min-height: 0;
+    height: auto;
+    min-height: 200px;
     display: grid;
-    grid-template-rows: minmax(0, 1fr);
+    grid-template-rows: minmax(160px, 1fr);
     gap: 12px;
-    padding: 14px 16px 12px;
+    padding: 14px 16px 14px;
   }
   .items-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .details-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .media-frame--item {
+    min-height: 160px;
+  }
   .media-frame--item img { object-fit: contain; padding: 7px; }
   .media-frame--detail img { object-fit: cover; object-position: center 24%; }
   .media-frame--detail img.focus-full {
@@ -242,7 +257,8 @@
     object-position: center center;
   }
   .palette-grid {
-    height: calc(100% - 54px);
+    height: auto;
+    min-height: 200px;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
@@ -271,10 +287,13 @@
     display: grid;
     grid-template-columns: 1.22fr 0.95fr 0.82fr;
     gap: 18px;
+    align-items: stretch;
   }
   .summary-row > .panel {
     min-height: 0;
     overflow: hidden;
+    display: grid;
+    grid-template-rows: 54px minmax(0, auto);
   }
   .summary-copy {
     padding: 18px 20px;
@@ -292,7 +311,7 @@
   }
   .traits li::marker { color: var(--accent); }
   .tags {
-    padding: 20px 18px;
+    padding: 20px 18px 22px;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 13px;

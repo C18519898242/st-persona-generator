@@ -53,17 +53,19 @@ EXPECTED_ASSETS = {
     ),
 }
 
-# 略松的半身像：头+双肩+上半身，避免大头特写占满画面
+# 半身像标准（对齐优质表情参考：头+肩+胸部，下沿在胸部稍下）
+# 参考：吴莹莹 assets_简介 backup/exp_think.jpg 一类构图
 HEADSHOT_FRAMING = (
-    "构图必须是【上半身半身像】，不要大头特写，也不要全身立绘："
-    "完整头发、头部、双肩与上半身入镜，画面下沿约到胸口中下部或上腹一带，"
-    "上衣主体应清楚可见（不只是领口）；不要裁到腰线以下，不要拍到腿。"
-    "头部（含发型）约占画面高度 35%–45%，双眼中心约在画面高度 28% 一带，"
-    "脸部水平居中，头顶上方留少量空隙；镜头距离固定为半身像，禁止脸部占满画幅。"
+    "构图必须是【胸上半身像】，不要大头特写，也不要拍到腰腹的大半身或全身："
+    "完整头发、头部、双肩与胸部入镜；画面下沿约在胸部下方一点点"
+    "（约罩杯下缘再稍下，能看清上衣胸前与肩线，但不要到肚脐/腰线）。"
+    "上衣胸前主体清楚可见；禁止只露领口的大特写，禁止裁到腰线以下，禁止入镜腿部。"
+    "头部（含发型）约占画面高度 38%–48%，双眼中心约在画面高度 30% 一带，"
+    "脸部水平居中，头顶上方留少量空隙；六张表情同一镜头距离，禁止忽近忽远。"
 )
-# bootstrap 头像若仍偏长，仅轻度去掉最下方再 fit（保留半身比例）
-HEADSHOT_KEEP_TOP_RATIO = 0.90
-HEADSHOT_CENTERING = (0.5, 0.40)
+# bootstrap 头像若仍偏长（拍到腰），轻度去掉最下方再 fit
+HEADSHOT_KEEP_TOP_RATIO = 0.88
+HEADSHOT_CENTERING = (0.5, 0.38)
 
 
 def load_env_file(path: Path) -> None:
@@ -261,6 +263,29 @@ def _profile_summary(character: CharacterInput) -> str:
     )
 
 
+def _outfit_labels(character: CharacterInput) -> list[str]:
+    """从 profile.images.items 取出四件单品 label（有序）。"""
+    images = character.config.get("images")
+    if not isinstance(images, dict):
+        return []
+    items = images.get("items")
+    if not isinstance(items, list):
+        return []
+    labels: list[str] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label")
+        if isinstance(label, str) and label.strip():
+            labels.append(label.strip())
+    return labels
+
+
+def _outfit_summary(character: CharacterInput) -> str:
+    labels = _outfit_labels(character)
+    return "、".join(labels) if labels else ""
+
+
 def build_prompt(character: CharacterInput, task: AssetTask) -> str:
     """为一个标准素材任务生成确定性的中文提示词。"""
     if task.kind == "expression":
@@ -290,11 +315,21 @@ def build_prompt(character: CharacterInput, task: AssetTask) -> str:
             "view_side.jpg": "标准左侧面",
             "view_back.jpg": "标准背面",
         }[task.filename]
+        outfit = _outfit_summary(character)
         specific = (
             f"生成单张{view_instruction}全身立绘，自然站立，双臂自然下垂。"
             "从头顶到鞋底完整可见，头发和鞋不能被裁切；人物占画面高度约 88%，"
-            "透视自然，不改变服装，不做动态姿势。"
+            "透视自然，不做动态姿势。"
         )
+        if outfit:
+            specific += (
+                f"【着装以 profile 服装拆解单品为准】必须完整穿着：{outfit}。"
+                "三视图与服装拆解必须是同一套衣服；"
+                "若参考全身图是西装长裤/其他套装，而单品写的是半身裙等，"
+                "必须以单品列表为准重绘着装，禁止照抄参考图里冲突的服装。"
+            )
+        else:
+            specific += "不改变参考图中的服装结构与主色。"
         if task.filename == "view_back.jpg":
             specific += (
                 "画面中只能出现一个人物，只显示这个人物的完整背面，"
@@ -322,17 +357,25 @@ def build_prompt(character: CharacterInput, task: AssetTask) -> str:
             "item_hose.jpg": "袜类单件（丝袜/连裤袜等，仅袜子本身）",
             "item_shoes.jpg": "鞋类单件（高跟鞋/凉鞋/皮鞋等一双鞋）",
         }.get(task.filename, "单件服装")
+        outfit = _outfit_summary(character)
         specific = (
             f"生成单张服装拆解【产品静物图】，类别：{slot_kind}。"
-            f"画面中只允许出现这一件商品，商品名称/描述为“{task.label}”。"
+            f"【品类以 label 为唯一标准】商品名称/描述为“{task.label}”，"
+            "必须生成与该描述一致的那一件单品，禁止换成其他品类："
+            "例如 label 含半身裙/A字裙时禁止生成长裤或西装裤；"
+            "label 是衬衫时禁止生成西装外套；label 是皮鞋时禁止生成凉鞋（除非 label 写凉鞋）。"
+            "画面中只允许出现这一件商品。"
             "必须是电商产品图风格：单件衣物平铺或悬空，浅色纯色背景。"
             "严禁整套穿搭拼贴、严禁把上衣+裙子+鞋子叠在同一张图里。"
             "严禁出现人物、人体、模特、头、手、脚、腿、人体轮廓或阴影。"
             "严禁衣架、其他衣物、配件、文字、水印、拼图分格。"
             "这不是穿在身上的效果图，也不是隐形模特摄影；"
             "衣物内部、后方、上方和下方都必须为空，只保留这一件商品。"
-            "物品完整、纵向居中，颜色材质剪裁尽量贴近参考图中的对应单品。"
+            "物品完整、纵向居中。"
+            "参考图仅可借鉴材质光泽与近似色，不得覆盖 label 规定的品类与款式。"
         )
+        if outfit:
+            specific += f"本角色完整工作装单品为：{outfit}；本张只画其中的“{task.label}”。"
     else:
         raise GeneratorError(f"未知素材类型：{task.kind}")
     width, height = task.target_size

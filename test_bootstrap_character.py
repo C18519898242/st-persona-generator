@@ -481,20 +481,38 @@ class ImageBootstrapTests(unittest.TestCase):
 
     def test_portrait_prompt_requires_half_body_bust_framing(self):
         prompt = bootstrap.build_portrait_prompt(self.config)
-        self.assertIn("上半身半身像", prompt)
-        self.assertIn("35%–45%", prompt)
-        self.assertIn("禁止脸部占满画幅", prompt)
+        self.assertIn("胸上半身像", prompt)
+        self.assertIn("胸部下方一点点", prompt)
+        self.assertIn("38%–48%", prompt)
         self.assertIn("半身像参考图", prompt)
+        self.assertIn("全身立绘", prompt)
+        self.assertIn("上装必须与全身立绘一致", prompt)
+        self.assertIn("摄影棚纯净", prompt)
+        self.assertIn("严禁椅子", prompt)
 
-    def test_ensure_images_writes_portrait_and_full_body(self):
-        calls = {"n": 0}
+    def test_full_body_prompt_requires_pure_studio_background(self):
+        prompt = bootstrap.build_full_body_prompt(self.config)
+        self.assertIn("摄影棚纯净", prompt)
+        self.assertIn("严禁椅子", prompt)
+        self.assertIn("严禁室内家居场景", prompt)
+        self.assertNotIn("简洁室内", prompt)
+
+    def test_ensure_images_writes_full_body_before_portrait(self):
+        calls = {"n": 0, "order": []}
 
         def transport(url, headers, payload, timeout):
             calls["n"] += 1
-            # return large enough source
-            if calls["n"] == 1:
-                return image_response(png_bytes((896, 1280)))
-            return image_response(png_bytes((1024, 1536)))
+            parts = payload["contents"][0]["parts"]
+            text = parts[0]["text"]
+            # 第一次应为全身（无「锚定全身」类半身措辞），且参考仅为 sample
+            # 第二次半身：提示含全身立绘锚点，且 parts 含全身像之后的多图
+            if "标准正面全身立绘" in text or "从头顶到鞋底" in text:
+                calls["order"].append("full")
+                return image_response(png_bytes((1024, 1536)))
+            calls["order"].append("portrait")
+            # 半身请求必须以全身像路径对应的图为参考之一（至少 1 text + 1 image）
+            self.assertGreaterEqual(len(parts), 2)
+            return image_response(png_bytes((896, 1280)))
 
         portrait, full_body = bootstrap.ensure_reference_images(
             self.paths,
@@ -513,6 +531,7 @@ class ImageBootstrapTests(unittest.TestCase):
         with Image.open(full_body) as image:
             self.assertEqual(image.size, (1024, 1536))
         self.assertEqual(calls["n"], 2)
+        self.assertEqual(calls["order"], ["full", "portrait"])
 
         # skip on second run
         bootstrap.ensure_reference_images(
@@ -526,6 +545,36 @@ class ImageBootstrapTests(unittest.TestCase):
             transport=transport,
         )
         self.assertEqual(calls["n"], 2)
+
+    def test_portrait_generation_passes_full_body_as_first_reference(self):
+        name = self.config["name"]
+        full_path = self.character_dir / f"{name}_全身像.png"
+        write_png(full_path, (1024, 1536))
+        seen = {}
+
+        def transport(url, headers, payload, timeout):
+            parts = payload["contents"][0]["parts"]
+            seen["n_parts"] = len(parts)
+            seen["text"] = parts[0]["text"]
+            # part[1] 应为全身像（第一参考）
+            self.assertIn("inlineData", parts[1])
+            return image_response(png_bytes((896, 1280)))
+
+        portrait, full_body = bootstrap.ensure_reference_images(
+            self.paths,
+            self.config,
+            api_key="k",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=False,
+            dry_run=False,
+            transport=transport,
+        )
+        self.assertEqual(full_body, full_path)
+        self.assertTrue(portrait.is_file())
+        self.assertIn("全身立绘", seen["text"])
+        # text + full_body + sample ref(s)
+        self.assertGreaterEqual(seen["n_parts"], 2)
 
     def test_legacy_sized_refs_skip_generation(self):
         name = self.config["name"]

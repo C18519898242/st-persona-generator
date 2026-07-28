@@ -154,8 +154,31 @@ class SharedTemplateRegressionTests(unittest.TestCase):
         self.assertRegex(
             self.template,
             re.compile(
-                r"\.asset-grid\s*\{[^}]*min-height:\s*0"
-                r"[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)",
+                r"\.asset-grid\s*\{[^}]*min-height:\s*200px",
+                re.DOTALL,
+            ),
+        )
+
+    def test_sheet_height_grows_with_content(self):
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.sheet\s*\{[^}]*height:\s*auto"
+                r"[^}]*min-height:\s*var\(--sheet-height\)",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"figcaption\s*\{[^}]*overflow-wrap:\s*anywhere",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.image-card\s*\{[^}]*grid-template-rows:\s*minmax\(0,\s*1fr\)\s+auto",
                 re.DOTALL,
             ),
         )
