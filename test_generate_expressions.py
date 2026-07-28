@@ -238,3 +238,121 @@ class PromptAndRequestTests(unittest.TestCase):
         with Image.open(io.BytesIO(result)) as image:
             self.assertEqual(image.size, (896, 1280))
             self.assertIn("A", image.getbands())
+
+
+class GenerationWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character = "workflow-character"
+        self.character_dir = self.root / self.character
+        self.character_dir.mkdir()
+        (self.character_dir / "profile.json").write_text(
+            json.dumps(
+                {
+                    "name": self.character,
+                    "bio": "鎴愬勾濂虫€?",
+                    "traits": ["榛戝彂"],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        write_png(self.character_dir / f"{self.character}_头像.png", (864, 1152))
+        write_png(self.character_dir / f"{self.character}_全身像.png", (1086, 1448))
+        self.paths = expressions.resolve_expression_paths(self.root, self.character)
+
+    def test_generates_neutral_first_and_uses_it_for_other_labels(self):
+        calls = []
+
+        def generator(**kwargs):
+            calls.append(kwargs)
+            return png_bytes()
+
+        result = expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            image_generator=generator,
+        )
+
+        self.assertEqual(calls[0]["label"], "neutral")
+        self.assertEqual(len(calls[0]["reference_paths"]), 2)
+        self.assertEqual(len(calls[1]["reference_paths"]), 3)
+        self.assertEqual(
+            calls[1]["reference_paths"][-1],
+            self.paths.output_dir / "neutral.png",
+        )
+        self.assertEqual(len(result.generated), 28)
+        self.assertEqual(result.failed, ())
+
+    def test_skips_valid_files_but_overwrite_regenerates_them(self):
+        existing = self.paths.output_dir / "neutral.png"
+        write_png(existing)
+        calls = []
+
+        def generator(**kwargs):
+            calls.append(kwargs["label"])
+            return png_bytes()
+
+        result = expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            image_generator=generator,
+        )
+        self.assertIn("neutral", result.skipped)
+        self.assertNotIn("neutral", calls)
+
+        calls.clear()
+        expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            overwrite=True,
+            image_generator=generator,
+        )
+        self.assertIn("neutral", calls)
+
+    def test_invalid_existing_file_is_regenerated(self):
+        write_png(self.paths.output_dir / "neutral.png", (64, 64))
+        calls = []
+
+        def generator(**kwargs):
+            calls.append(kwargs["label"])
+            return png_bytes()
+
+        expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            image_generator=generator,
+        )
+        self.assertIn("neutral", calls)
+
+    def test_one_failure_is_recorded_and_later_labels_continue(self):
+        calls = []
+
+        def generator(**kwargs):
+            label = kwargs["label"]
+            calls.append(label)
+            if label == "anger":
+                raise expressions.ExpressionError("planned failure")
+            return png_bytes()
+
+        result = expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            image_generator=generator,
+        )
+
+        self.assertEqual(result.failed, ("anger",))
+        self.assertIn("surprise", calls)
+        self.assertFalse((self.paths.output_dir / "anger.png").exists())

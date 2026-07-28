@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import io
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Any, Callable, Sequence
 from urllib.error import URLError
@@ -77,6 +78,13 @@ class ExpressionPaths:
     full_body_path: Path
     output_dir: Path
     zip_path: Path
+
+
+@dataclass(frozen=True)
+class ExpressionRunResult:
+    generated: tuple[str, ...]
+    skipped: tuple[str, ...]
+    failed: tuple[str, ...]
 
 
 def _profile_summary(profile: dict) -> str:
@@ -192,6 +200,87 @@ def normalize_expression_png(image_bytes: bytes) -> bytes:
         raise gemini.RetryableGenerationError(
             "Gemini 返回的表情图片无法解码"
         ) from exc
+
+
+def generate_expression_images(
+    paths: ExpressionPaths,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    overwrite: bool = False,
+    image_generator: Callable[..., bytes] | None = None,
+) -> ExpressionRunResult:
+    if not api_key.strip():
+        raise ExpressionError("Missing GEMINI_API_KEY")
+    profile = json.loads(paths.profile_path.read_text(encoding="utf-8-sig"))
+    paths.output_dir.mkdir(parents=True, exist_ok=True)
+    generator = image_generator or _generate_one_expression
+    generated: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+    order = ("neutral",) + tuple(
+        label for label in EXPRESSION_LABELS if label != "neutral"
+    )
+    for label in order:
+        output_path = paths.output_dir / f"{label}.png"
+        if not overwrite and is_valid_expression_png(output_path):
+            skipped.append(label)
+            continue
+        references = [paths.portrait_path, paths.full_body_path]
+        neutral_path = paths.output_dir / "neutral.png"
+        if label != "neutral":
+            if not is_valid_expression_png(neutral_path):
+                failed.append(label)
+                continue
+            references.append(neutral_path)
+        try:
+            raw = generator(
+                label=label,
+                profile=profile,
+                reference_paths=tuple(references),
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
+            normalized = normalize_expression_png(raw)
+            gemini.atomic_write(output_path, normalized)
+            if not is_valid_expression_png(output_path):
+                raise ExpressionError(f"Written image did not validate: {output_path}")
+            generated.append(label)
+        except (
+            OSError,
+            ExpressionError,
+            gemini.GeneratorError,
+            URLError,
+            TimeoutError,
+            ConnectionError,
+        ) as exc:
+            print(f"Expression generation failed for {label}: {exc}", file=sys.stderr)
+            failed.append(label)
+    return ExpressionRunResult(
+        generated=tuple(generated),
+        skipped=tuple(skipped),
+        failed=tuple(failed),
+    )
+
+
+def _generate_one_expression(
+    *,
+    label: str,
+    profile: dict,
+    reference_paths: Sequence[Path],
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> bytes:
+    return request_expression_image(
+        prompt=build_expression_prompt(profile, label),
+        reference_paths=reference_paths,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+    )
 
 
 def request_expression_image(
