@@ -884,15 +884,24 @@ FULL_BODY_RATIO = "2:3"
 def normalize_image_png(
     image_bytes: bytes,
     target_size: tuple[int, int],
+    *,
+    headshot: bool = False,
 ) -> bytes:
+    """无拉伸 fit 到目标尺寸并输出 PNG；头像启用头肩特写收紧。"""
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             source.load()
+            if headshot:
+                prepared = gemini.prepare_headshot_rgb(source)
+                centering = gemini.HEADSHOT_CENTERING
+            else:
+                prepared = source.convert("RGB")
+                centering = (0.5, 0.5)
             normalized = ImageOps.fit(
-                source.convert("RGB"),
+                prepared,
                 target_size,
                 method=Image.Resampling.LANCZOS,
-                centering=(0.5, 0.5),
+                centering=centering,
             )
             output = io.BytesIO()
             normalized.save(output, format="PNG", optimize=True)
@@ -984,8 +993,10 @@ def build_portrait_prompt(config: dict[str, Any]) -> str:
         "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
         + _profile_image_summary(config)
         + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官、发型与体型。"
-        "生成单张半身肖像：完整头发、头部、双肩和少量上半身，表情自然平静。"
-        "双眼中心约在画面高度 30% 一带。背景干净暖米白，柔和人像光。"
+        "生成单张人物头像参考图，表情自然平静。"
+        + gemini.HEADSHOT_FRAMING
+        + "上装颜色与版型尽量贴近默认工作装或不与之冲突。"
+        "背景干净暖米白，柔和人像光。"
         "不要文字、标签、边框、拼图、水印、额外人物。"
         f"目标比例 {PORTRAIT_RATIO}，交付尺寸 {PORTRAIT_SIZE[0]}×{PORTRAIT_SIZE[1]}。"
         "只输出一张图片。"
@@ -1046,7 +1057,11 @@ def request_bootstrap_image(
         try:
             response = transport(url, headers, payload, timeout)
             image_bytes, _ = gemini.extract_image(response)
-            return normalize_image_png(image_bytes, target_size)
+            return normalize_image_png(
+                image_bytes,
+                target_size,
+                headshot=(target_size == PORTRAIT_SIZE),
+            )
         except gemini.HttpStatusError as exc:
             retryable = exc.status == 429 or 500 <= exc.status <= 599
             if not retryable or attempt == max_attempts:

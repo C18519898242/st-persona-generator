@@ -168,12 +168,22 @@ class CharacterPlanningTests(unittest.TestCase):
                 generator.build_prompt(character, task),
             )
 
-        for prompt in prompts.values():
+        for kind, prompt in prompts.items():
             self.assertIn("成年人", prompt)
             self.assertIn("完整着装", prompt)
             self.assertIn("不要文字", prompt)
+            if kind != "expression":
+                self.assertIn("禁止换人", prompt)
         self.assertIn("从头顶到鞋底完整可见", prompts["view"])
-        self.assertIn("只改变目标表情", prompts["expression"])
+        self.assertIn("表情编辑", prompts["expression"])
+        self.assertIn("仅以参考头像图像为准", prompts["expression"])
+        self.assertNotIn("人物简介", prompts["expression"])
+        self.assertIn("标准头像特写", prompts["expression"])
+        self.assertIn("锁骨或胸口中上部", prompts["expression"])
+        self.assertIn("双肩与上衣领口必须可见", prompts["expression"])
+        self.assertIn("禁止比参考头像更近的大脸特写", prompts["expression"])
+        self.assertIn("禁止换人换脸", prompts["expression"])
+        self.assertIn("禁止手部遮挡主要五官", prompts["expression"])
         self.assertIn("严禁出现人物、人体", prompts["item"])
 
     def test_back_view_forbids_front_back_comparison(self):
@@ -243,6 +253,25 @@ class GeminiClientTests(unittest.TestCase):
             "responseFormat",
             request["generationConfig"],
         )
+
+    def test_expression_request_uses_portrait_only_never_calm_or_full_body(self):
+        calm_path = self.character.assets_dir / "exp_calm.jpg"
+        calm_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 96), "#C49A8A").save(calm_path, format="JPEG")
+        for filename in ("exp_calm.jpg", "exp_smile.jpg"):
+            expression = next(
+                task
+                for task in generator.build_tasks(self.character)
+                if task.filename == filename
+            )
+            parts = generator.build_request(self.character, expression)[
+                "contents"
+            ][0]["parts"]
+            self.assertEqual(len(parts), 2, filename)
+            self.assertEqual(
+                base64.b64decode(parts[1]["inlineData"]["data"]),
+                self.character.portrait_path.read_bytes(),
+            )
 
     def test_extract_image_reads_camel_case_inline_data(self):
         self.assertEqual(
@@ -397,6 +426,29 @@ class ImageProcessingTests(unittest.TestCase):
             right = image.getpixel((90, 50))
             self.assertGreater(left[0], left[2])
             self.assertGreater(right[2], right[0])
+
+    def test_normalize_headshot_keeps_upper_region(self):
+        """偏长半身图在 headshot 模式下应收紧，上方内容占比更高。"""
+        image = Image.new("RGB", (100, 200), "blue")
+        for y in range(0, 100):
+            for x in range(100):
+                image.putpixel((x, y), (255, 0, 0))  # 上半红=脸肩
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        source = buffer.getvalue()
+
+        plain = generator.normalize_image(source, (50, 100), headshot=False)
+        headshot = generator.normalize_image(source, (50, 100), headshot=True)
+
+        def red_fraction(raw: bytes) -> float:
+            with Image.open(io.BytesIO(raw)) as img:
+                img.load()
+                pixels = list(img.getdata())
+            return sum(1 for p in pixels if p[0] > 200) / len(pixels)
+
+        with Image.open(io.BytesIO(headshot)) as head_img:
+            self.assertEqual(head_img.size, (50, 100))
+        self.assertGreater(red_fraction(headshot), red_fraction(plain))
 
     def test_is_valid_output_requires_exact_size_and_complete_jpeg(self):
         valid = self.root / "valid.jpg"

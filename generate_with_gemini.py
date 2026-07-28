@@ -53,6 +53,18 @@ EXPECTED_ASSETS = {
     ),
 }
 
+# 证件照式头肩特写：与参考头像红框一致——脸+双肩，少露躯干
+HEADSHOT_FRAMING = (
+    "构图必须是证件照式【标准头像特写】，不是半身照、不是大半身、不是全身："
+    "完整头发、头部与双肩入镜，画面下沿约到锁骨或胸口中上部，"
+    "只露出少量上衣领口与肩线，不要拍到腰线、腹部或大量上衣下摆；"
+    "头部（含发型）约占画面高度 50%–60%，双眼中心约在画面高度 34% 一带，"
+    "脸部水平居中，头顶上方留少量空隙；镜头距离固定为近景头像。"
+)
+# 若模型仍输出偏长的半身，落盘前裁掉下方多余躯干再 fit
+HEADSHOT_KEEP_TOP_RATIO = 0.76
+HEADSHOT_CENTERING = (0.5, 0.32)
+
 
 def load_env_file(path: Path) -> None:
     """读取简单 KEY=VALUE 格式的 .env，且不覆盖已有环境变量。"""
@@ -251,14 +263,27 @@ def _profile_summary(character: CharacterInput) -> str:
 
 def build_prompt(character: CharacterInput, task: AssetTask) -> str:
     """为一个标准素材任务生成确定性的中文提示词。"""
-    shared = (
-        "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
-        + _profile_summary(character)
-        + "严格保持两张参考图中的同一人物身份、成年年龄感、脸型、五官、"
-        "黑色直发与齐刘海、体型比例、服装结构和主色一致。"
-        "背景使用干净统一的暖米白摄影棚，柔和均匀人像光。"
-        "不要文字、标签、边框、拼图、水印、额外人物或无关物品。"
-    )
+    if task.kind == "expression":
+        # 表情任务以参考头像为唯一外貌源，避免长 bio/traits 文字描述带偏换脸
+        name = character.config.get("name", "")
+        shared = (
+            "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+            f"人物：{name}。"
+            "外貌身份与构图【仅以参考头像图像为准】，"
+            "若文字描述与参考头像冲突，一律以参考头像为准。"
+            "背景使用干净统一的暖米白摄影棚，柔和均匀人像光。"
+            "不要文字、标签、边框、拼图、水印、额外人物或无关物品。"
+        )
+    else:
+        shared = (
+            "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
+            + _profile_summary(character)
+            + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官比例、"
+            "瞳色肤色、发型发色与刘海形状、体型比例、服装结构和主色一致；"
+            "禁止换人、换脸或改变年龄感。"
+            "背景使用干净统一的暖米白摄影棚，柔和均匀人像光。"
+            "不要文字、标签、边框、拼图、水印、额外人物或无关物品。"
+        )
     if task.kind == "view":
         view_instruction = {
             "view_front.jpg": "标准正面",
@@ -278,10 +303,17 @@ def build_prompt(character: CharacterInput, task: AssetTask) -> str:
             )
     elif task.kind == "expression":
         specific = (
-            f"生成单张半身肖像，目标表情为“{task.label}”。"
-            "只改变目标表情和与表情直接相关的细微头部动作，"
-            "保持镜头距离、脸、发型、服装、背景和光线一致。"
-            "包含完整头发、头部、双肩和少量上半身。"
+            f"这是【表情编辑】任务，不是重新创造一张新面孔。"
+            f"目标表情为“{task.label}”。"
+            "【参考图1】是唯一身份与构图锁定源（人物头像）。"
+            "输出必须是参考头像中的同一个人：脸型骨骼、眼距、鼻梁、唇形、发际线、"
+            "发型发色、肤色瞳色全部锁定，禁止换人换脸。"
+            "构图必须与参考头像一致：同样的证件照头肩距离，双肩与上衣领口必须可见，"
+            "禁止比参考头像更近的大脸特写，禁止裁掉头、肩或领口。"
+            + HEADSHOT_FRAMING
+            + "背景、光线、服装颜色与参考头像保持一致。"
+            "只改变眉、眼、嘴以表达目标表情；不要改发型、不要换装、不要大幅转头。"
+            "禁止夸张漫画表情，禁止手部遮挡主要五官。"
         )
     elif task.kind == "item":
         slot_kind = {
@@ -335,6 +367,22 @@ def encode_reference(path: Path) -> dict[str, Any]:
     }
 
 
+def reference_parts_for_task(
+    character: CharacterInput,
+    task: AssetTask,
+) -> list[dict[str, Any]]:
+    """按素材类型选择参考图。
+
+    表情只锚定人物头像，避免错误/过近的 exp_calm 污染后续表情身份与构图。
+    三视图与服装拆解使用头像+全身像。
+    """
+    parts = [encode_reference(character.portrait_path)]
+    if task.kind == "expression":
+        return parts
+    parts.append(encode_reference(character.full_body_path))
+    return parts
+
+
 def build_request(
     character: CharacterInput,
     task: AssetTask,
@@ -346,8 +394,7 @@ def build_request(
                 "role": "user",
                 "parts": [
                     {"text": build_prompt(character, task)},
-                    encode_reference(character.portrait_path),
-                    encode_reference(character.full_body_path),
+                    *reference_parts_for_task(character, task),
                 ],
             }
         ],
@@ -511,19 +558,40 @@ def request_image(
     raise AssertionError("不可达的重试状态")
 
 
+def prepare_headshot_rgb(image: Image.Image) -> Image.Image:
+    """把偏长的半身图收成头肩特写：保留上部，再交给 fit。"""
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    keep_height = max(1, int(height * HEADSHOT_KEEP_TOP_RATIO))
+    if keep_height < height:
+        rgb = rgb.crop((0, 0, width, keep_height))
+    return rgb
+
+
 def normalize_image(
     image_bytes: bytes,
     target_size: tuple[int, int],
+    *,
+    headshot: bool = False,
 ) -> bytes:
-    """无拉伸地居中裁切并输出高质量 RGB JPEG。"""
+    """无拉伸地居中裁切并输出高质量 RGB JPEG。
+
+    headshot=True 时按证件照头肩特写收紧构图（去掉下方多余躯干）。
+    """
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
             source.load()
+            if headshot:
+                prepared = prepare_headshot_rgb(source)
+                centering = HEADSHOT_CENTERING
+            else:
+                prepared = source.convert("RGB")
+                centering = (0.5, 0.5)
             normalized = ImageOps.fit(
-                source.convert("RGB"),
+                prepared,
                 target_size,
                 method=Image.Resampling.LANCZOS,
-                centering=(0.5, 0.5),
+                centering=centering,
             )
             output = io.BytesIO()
             normalized.save(
@@ -622,7 +690,12 @@ def run_generation(
             transport=transport,
             sleeper=sleeper,
         )
-        normalized = normalize_image(image_bytes, task.target_size)
+        # 表情不做二次头肩强裁：否则会把正确头像裁成大脸特写，偏离参考头像构图
+        normalized = normalize_image(
+            image_bytes,
+            task.target_size,
+            headshot=False,
+        )
         atomic_write(output_path, normalized)
         if not is_valid_output(output_path, task.target_size):
             raise GeneratorError(f"图片写入后校验失败：{output_path}")

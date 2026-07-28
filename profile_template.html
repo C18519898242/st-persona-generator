@@ -97,9 +97,14 @@
   .header-seal small { margin-top: 5px; font-size: 10px; letter-spacing: 0.18em; }
 
   .profile-main {
+    min-height: 0;
     display: grid;
     grid-template-columns: 255px minmax(0, 1fr) 350px;
     gap: 18px;
+  }
+  .profile-main > .panel {
+    min-height: 0;
+    overflow: hidden;
   }
   .panel {
     border: 1px solid var(--rule);
@@ -262,9 +267,14 @@
   .swatch small { color: var(--muted); font: 10px/1 Consolas, monospace; }
 
   .summary-row {
+    min-height: 0;
     display: grid;
     grid-template-columns: 1.22fr 0.95fr 0.82fr;
     gap: 18px;
+  }
+  .summary-row > .panel {
+    min-height: 0;
+    overflow: hidden;
   }
   .summary-copy {
     padding: 18px 20px;

@@ -479,6 +479,13 @@ class ImageBootstrapTests(unittest.TestCase):
             self.assertEqual(image.size, (896, 1280))
             self.assertEqual(image.format, "PNG")
 
+    def test_portrait_prompt_requires_id_photo_headshot_framing(self):
+        prompt = bootstrap.build_portrait_prompt(self.config)
+        self.assertIn("标准头像特写", prompt)
+        self.assertIn("锁骨或胸口中上部", prompt)
+        self.assertIn("不要拍到腰线", prompt)
+        self.assertNotIn("半身肖像", prompt)
+
     def test_ensure_images_writes_portrait_and_full_body(self):
         calls = {"n": 0}
 

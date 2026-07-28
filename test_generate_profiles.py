@@ -160,6 +160,42 @@ class SharedTemplateRegressionTests(unittest.TestCase):
             ),
         )
 
+    def test_main_profile_panels_cannot_expand_past_their_grid_row(self):
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.profile-main\s*\{[^}]*min-height:\s*0",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.profile-main\s*>\s*\.panel\s*\{"
+                r"[^}]*min-height:\s*0"
+                r"[^}]*overflow:\s*hidden",
+                re.DOTALL,
+            ),
+        )
+
+    def test_summary_panels_cannot_expand_into_the_footer(self):
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.summary-row\s*\{[^}]*min-height:\s*0",
+                re.DOTALL,
+            ),
+        )
+        self.assertRegex(
+            self.template,
+            re.compile(
+                r"\.summary-row\s*>\s*\.panel\s*\{"
+                r"[^}]*min-height:\s*0"
+                r"[^}]*overflow:\s*hidden",
+                re.DOTALL,
+            ),
+        )
+
     def test_second_detail_uses_the_original_side_view(self):
         for character in ("夏语冰", "吴莹莹"):
             config_path = self.root / character / "profile.json"
