@@ -36,7 +36,7 @@ DEFAULT_DISPLAY = {
     "sideScale": 1.04,
     "backScale": 1.04,
     "expressionAspect": 0.7,
-    "expressionPosition": "center 22%",
+    "expressionPosition": "center 30%",
 }
 
 FIXED_VIEWS = [
@@ -993,7 +993,7 @@ def build_portrait_prompt(config: dict[str, Any]) -> str:
         "用途：专业人物设定资料。角色明确为成年人，完整着装，非露骨内容。"
         + _profile_image_summary(config)
         + "严格保持参考图中的同一人物身份、成年年龄感、脸型、五官、发型与体型。"
-        "生成单张人物头像参考图，表情自然平静。"
+        "生成单张人物半身像参考图，表情自然平静。"
         + gemini.HEADSHOT_FRAMING
         + "上装颜色与版型尽量贴近默认工作装或不与之冲突。"
         "背景干净暖米白，柔和人像光。"
