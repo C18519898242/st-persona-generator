@@ -3,15 +3,19 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import io
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Sequence
 from urllib.error import URLError
 from urllib.parse import quote
+import zipfile
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -85,6 +89,13 @@ class ExpressionRunResult:
     generated: tuple[str, ...]
     skipped: tuple[str, ...]
     failed: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ExpressionPackResult:
+    paths: ExpressionPaths
+    images: ExpressionRunResult
+    zip_path: Path | None
 
 
 def _profile_summary(profile: dict) -> str:
@@ -180,6 +191,39 @@ def is_valid_expression_png(path: Path) -> bool:
             )
     except (OSError, UnidentifiedImageError):
         return False
+
+
+def create_expression_zip(paths: ExpressionPaths) -> Path:
+    missing = [
+        label
+        for label in EXPRESSION_LABELS
+        if not is_valid_expression_png(paths.output_dir / f"{label}.png")
+    ]
+    if missing:
+        raise ExpressionError("缺少有效表情图片：" + ", ".join(missing))
+    paths.zip_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{paths.character}_expressions-",
+        suffix=".zip",
+        dir=paths.zip_path.parent,
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(
+            temporary_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for label in EXPRESSION_LABELS:
+                archive.write(
+                    paths.output_dir / f"{label}.png",
+                    arcname=f"{label}.png",
+                )
+        os.replace(temporary_path, paths.zip_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return paths.zip_path
 
 
 def normalize_expression_png(image_bytes: bytes) -> bytes:
@@ -283,6 +327,103 @@ def _generate_one_expression(
     )
 
 
+def run_expression_pack(
+    *,
+    root: Path,
+    character: str,
+    api_key: str | None,
+    base_url: str,
+    model: str,
+    overwrite: bool = False,
+    create_zip: bool = True,
+    image_generator: Callable[..., bytes] | None = None,
+) -> ExpressionPackResult:
+    paths = resolve_expression_paths(root, character)
+    images = generate_expression_images(
+        paths,
+        api_key=api_key or "",
+        base_url=base_url,
+        model=model,
+        overwrite=overwrite,
+        image_generator=image_generator,
+    )
+    zip_path = None
+    if create_zip and not images.failed:
+        zip_path = create_expression_zip(paths)
+    return ExpressionPackResult(paths=paths, images=images, zip_path=zip_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate a SillyTavern-standard character expression pack.",
+    )
+    parser.add_argument("--character", required=True, help="Character directory name")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Character root directory (defaults to GEMINI_DEFAULT_ROOT)",
+    )
+    parser.add_argument(
+        "--model",
+        default=gemini.DEFAULT_MODEL,
+        help="Gemini image model",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=(
+            os.environ.get("GEMINI_BASE_URL")
+            or os.environ.get("GEMINI_BASE_RUL")
+            or gemini.DEFAULT_BASE_URL
+        ),
+        help="Gemini API base URL",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Regenerate already-valid expression images",
+    )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Do not create the ZIP expression pack",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        gemini.load_env_file(gemini.DEFAULT_ENV_FILE)
+    except (OSError, gemini.GeneratorError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    args = build_parser().parse_args(argv)
+    root = args.root if args.root is not None else gemini.get_default_root()
+    try:
+        result = run_expression_pack(
+            root=root,
+            character=args.character,
+            api_key=os.environ.get("GEMINI_API_KEY"),
+            base_url=args.base_url,
+            model=args.model,
+            overwrite=args.overwrite,
+            create_zip=not args.no_zip,
+        )
+    except (OSError, ExpressionError, gemini.GeneratorError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Generated: {len(result.images.generated)}")
+    print(f"Skipped: {len(result.images.skipped)}")
+    print(f"Failed: {len(result.images.failed)}")
+    if result.images.failed:
+        print("Failed labels: " + ", ".join(result.images.failed), file=sys.stderr)
+        return 1
+    print(f"Image directory: {result.paths.output_dir}")
+    if result.zip_path is not None:
+        print(f"ZIP: {result.zip_path}")
+    return 0
+
+
 def request_expression_image(
     *,
     prompt: str,
@@ -337,3 +478,6 @@ def request_expression_image(
                 raise
         sleeper(float(attempt))
     raise ExpressionError("表情图片生成失败")
+
+if __name__ == "__main__":
+    raise SystemExit(main())

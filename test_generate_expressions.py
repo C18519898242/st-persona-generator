@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import base64
+import zipfile
 from pathlib import Path
 
 from PIL import Image
@@ -356,3 +357,67 @@ class GenerationWorkflowTests(unittest.TestCase):
         self.assertEqual(result.failed, ("anger",))
         self.assertIn("surprise", calls)
         self.assertFalse((self.paths.output_dir / "anger.png").exists())
+
+
+class ZipPackagingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        character = "zip-character"
+        character_dir = root / character
+        character_dir.mkdir()
+        (character_dir / "profile.json").write_text(
+            json.dumps({"name": character}),
+            encoding="utf-8",
+        )
+        write_png(character_dir / f"{character}_头像.png")
+        write_png(character_dir / f"{character}_全身像.png")
+        self.paths = expressions.resolve_expression_paths(root, character)
+
+    def test_incomplete_outputs_do_not_create_zip(self):
+        write_png(self.paths.output_dir / "neutral.png")
+
+        with self.assertRaisesRegex(expressions.ExpressionError, r"\u7f3a\u5c11"):
+            expressions.create_expression_zip(self.paths)
+
+        self.assertFalse(self.paths.zip_path.exists())
+
+    def test_complete_zip_has_exactly_28_root_entries(self):
+        for label in expressions.EXPRESSION_LABELS:
+            write_png(self.paths.output_dir / f"{label}.png")
+
+        output = expressions.create_expression_zip(self.paths)
+
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(
+                archive.namelist(),
+                [f"{label}.png" for label in expressions.EXPRESSION_LABELS],
+            )
+            self.assertTrue(all("/" not in name for name in archive.namelist()))
+
+
+class CliTests(unittest.TestCase):
+    def test_parser_exposes_required_options(self):
+        args = expressions.build_parser().parse_args([
+            "--character", "cli-character",
+            "--root", "C:/persona",
+            "--model", "gemini-test",
+            "--overwrite",
+            "--no-zip",
+        ])
+
+        self.assertEqual(args.character, "cli-character")
+        self.assertEqual(args.root, Path("C:/persona"))
+        self.assertEqual(args.model, "gemini-test")
+        self.assertTrue(args.overwrite)
+        self.assertTrue(args.no_zip)
+
+    def test_main_returns_nonzero_when_required_input_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code = expressions.main([
+                "--character", "missing-character",
+                "--root", temp,
+            ])
+
+        self.assertEqual(code, 1)
