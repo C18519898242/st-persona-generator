@@ -421,3 +421,15 @@ class CliTests(unittest.TestCase):
             ])
 
         self.assertEqual(code, 1)
+
+
+class ReadmeTests(unittest.TestCase):
+    def test_readme_documents_expression_pack_command_and_import(self):
+        readme = (
+            Path(__file__).resolve().parent / "README.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("generate_expressions.py", readme)
+        self.assertIn('--character "吴莹莹"', readme)
+        self.assertIn("吴莹莹_expressions.zip", readme)
+        self.assertIn("上传表情图片包", readme)
+        self.assertIn("896 × 1280", readme)

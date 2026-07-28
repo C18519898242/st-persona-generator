@@ -570,6 +570,44 @@ python bootstrap_character.py --character 雨彤
 python generate_with_gemini.py --character 雨彤
 ```
 
+## 生成 SillyTavern 表情图片包
+
+角色目录已经包含 `profile.json`、`角色名_头像.png` 和 `角色名_全身像.png` 后，运行：
+
+```powershell
+python generate_expressions.py --character "吴莹莹"
+```
+
+脚本生成 SillyTavern 全部 28 个标准表情。图片保存在：
+
+```text
+吴莹莹/
+├── expressions/
+│   ├── neutral.png
+│   ├── joy.png
+│   ├── anger.png
+│   └── ...
+└── 吴莹莹_expressions.zip
+```
+
+表情图统一为 `896 × 1280` 上半身透明 PNG。脚本先生成
+`neutral.png`，其余图片使用头像、全身像和 neutral 图共同锁定人物身份、服装和构图。
+
+再次运行会跳过已有有效图片并继续缺失项目。要全部重做：
+
+```powershell
+python generate_expressions.py --character "吴莹莹" --overwrite
+```
+
+只生成图片、不创建 ZIP：
+
+```powershell
+python generate_expressions.py --character "吴莹莹" --no-zip
+```
+
+生成完成后，在 SillyTavern 的“角色表情”设置中点击
+“上传表情图片包（ZIP）”，选择 `吴莹莹_expressions.zip`。
+
 ### 使用 Gemini 生成 13 张图片和人物页面
 
 `generate_with_gemini.py` 会读取人物目录中的 `profile.json`、头像和全身像，
