@@ -7,7 +7,6 @@ import tempfile
 import unittest
 import base64
 from pathlib import Path
-from unittest.mock import patch
 
 from PIL import Image
 
@@ -25,6 +24,37 @@ EXPECTED_LABELS = (
     "pride", "realization", "relief", "remorse", "sadness",
     "surprise", "neutral",
 )
+
+EXPECTED_EXPRESSION_DESCRIPTIONS = {
+    "admiration": "欣赏与赞叹：眉眼柔和、目光明亮、轻微微笑",
+    "amusement": "被逗乐：眼角微弯、自然笑容",
+    "anger": "明确生气：眉头下压、目光锐利、嘴唇收紧",
+    "annoyance": "轻微烦躁：眉头略皱、目光不耐、嘴角轻压",
+    "approval": "认可赞同：温和注视、轻微点头感、克制微笑",
+    "caring": "关心体贴：眉眼柔和、专注温暖的目光",
+    "confusion": "困惑不解：一侧眉毛微抬、轻微皱眉",
+    "curiosity": "好奇探究：双眼略睁、眉毛轻抬、专注注视",
+    "desire": "向往期待：目光专注柔和、嘴唇微启",
+    "disappointment": "失望：眉眼下垂、嘴角轻微向下",
+    "disapproval": "不赞同：眉头微皱、嘴唇收紧、审视目光",
+    "disgust": "厌恶：鼻梁轻皱、上唇略抬、眉头收紧",
+    "embarrassment": "尴尬羞窘：目光轻微回避、克制不自然的微笑",
+    "excitement": "兴奋：眼睛明亮睁大、眉毛抬起、开心笑容",
+    "fear": "害怕：眉毛抬起并靠拢、眼睛睁大、嘴唇微张",
+    "gratitude": "感激：温暖目光、柔和真诚的微笑",
+    "grief": "悲痛：眉头内收上扬、眼神沉痛、嘴角下垂",
+    "joy": "喜悦：自然灿烂笑容、眼角弯曲",
+    "love": "爱意：温柔专注的目光、柔和微笑",
+    "nervousness": "紧张：眉毛略抬、嘴唇轻抿、目光稍显不安",
+    "optimism": "乐观：神情明朗、自信温和的微笑",
+    "pride": "自豪：眉眼自信、嘴角轻扬、神情从容",
+    "realization": "恍然大悟：眉毛抬起、眼睛略睁、嘴唇微张",
+    "relief": "如释重负：眉眼放松、轻轻呼气后的微笑",
+    "remorse": "懊悔：眉头内收、目光下垂、嘴角轻压",
+    "sadness": "悲伤：眉眼下垂、嘴角向下、神情低落",
+    "surprise": "惊讶：眉毛明显抬起、眼睛睁大、嘴巴微张",
+    "neutral": "自然平静：面部放松、目视镜头、嘴唇自然闭合",
+}
 
 
 def write_png(
@@ -69,6 +99,18 @@ class LabelContractTests(unittest.TestCase):
     def test_standard_labels_are_complete_unique_and_stable(self):
         self.assertEqual(expressions.EXPRESSION_LABELS, EXPECTED_LABELS)
         self.assertEqual(len(set(expressions.EXPRESSION_LABELS)), 28)
+
+
+class DescriptionContractTests(unittest.TestCase):
+    def test_expression_descriptions_match_fixed_contract(self):
+        self.assertEqual(
+            expressions.EXPRESSION_DESCRIPTIONS,
+            EXPECTED_EXPRESSION_DESCRIPTIONS,
+        )
+        self.assertEqual(
+            tuple(expressions.EXPRESSION_DESCRIPTIONS),
+            EXPECTED_LABELS,
+        )
 
 
 class PathAndValidationTests(unittest.TestCase):
