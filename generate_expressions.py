@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import io
 import json
@@ -70,6 +71,7 @@ EXPRESSION_DESCRIPTIONS = {
 }
 
 Transport = Callable[[str, dict[str, str], dict[str, Any], float], dict[str, Any]]
+NormalizedPngGenerator = Callable[..., bytes]
 
 
 @dataclass(frozen=True)
@@ -246,6 +248,68 @@ def normalize_expression_png(image_bytes: bytes) -> bytes:
         ) from exc
 
 
+def encode_expression_reference(
+    path: Path,
+    max_side: int = 2048,
+) -> dict[str, Any]:
+    """Encode one reference locally, retaining PNG transparency."""
+    suffix = path.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg"}:
+        raise ExpressionError(f"Unsupported reference image format: {path}")
+    try:
+        with Image.open(path) as source:
+            source.load()
+            image = (
+                source.convert("RGBA")
+                if suffix == ".png"
+                else source.convert("RGB")
+            )
+            width, height = image.size
+            longest = max(width, height)
+            if longest > max_side:
+                scale = max_side / float(longest)
+                image = image.resize(
+                    (
+                        max(1, int(width * scale)),
+                        max(1, int(height * scale)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            output = io.BytesIO()
+            if suffix == ".png":
+                image.save(output, format="PNG", optimize=True)
+                mime_type = "image/png"
+            else:
+                image.save(
+                    output,
+                    format="JPEG",
+                    quality=90,
+                    optimize=True,
+                )
+                mime_type = "image/jpeg"
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ExpressionError(f"Unable to read reference image: {path}") from exc
+    return {
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": base64.b64encode(output.getvalue()).decode("ascii"),
+        }
+    }
+
+
+def _is_normalized_expression_png(image_bytes: bytes) -> bool:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.load()
+            return (
+                image.format == "PNG"
+                and image.size == EXPRESSION_SIZE
+                and "A" in image.getbands()
+            )
+    except (OSError, UnidentifiedImageError):
+        return False
+
+
 def generate_expression_images(
     paths: ExpressionPaths,
     *,
@@ -253,8 +317,9 @@ def generate_expression_images(
     base_url: str,
     model: str,
     overwrite: bool = False,
-    image_generator: Callable[..., bytes] | None = None,
+    image_generator: NormalizedPngGenerator | None = None,
 ) -> ExpressionRunResult:
+    """Generate labels; generators return normalized RGBA PNG bytes."""
     if not api_key.strip():
         raise ExpressionError("Missing GEMINI_API_KEY")
     profile = json.loads(paths.profile_path.read_text(encoding="utf-8-sig"))
@@ -279,7 +344,7 @@ def generate_expression_images(
                 continue
             references.append(neutral_path)
         try:
-            raw = generator(
+            normalized_png = generator(
                 label=label,
                 profile=profile,
                 reference_paths=tuple(references),
@@ -287,14 +352,19 @@ def generate_expression_images(
                 base_url=base_url,
                 model=model,
             )
-            normalized = normalize_expression_png(raw)
-            gemini.atomic_write(output_path, normalized)
+            if not _is_normalized_expression_png(normalized_png):
+                raise ExpressionError(
+                    "Image generator did not return a normalized "
+                    f"{EXPRESSION_SIZE[0]}x{EXPRESSION_SIZE[1]} RGBA PNG"
+                )
+            gemini.atomic_write(output_path, normalized_png)
             if not is_valid_expression_png(output_path):
                 raise ExpressionError(f"Written image did not validate: {output_path}")
             generated.append(label)
         except (
             OSError,
             ExpressionError,
+            bootstrap.BootstrapError,
             gemini.GeneratorError,
             URLError,
             TimeoutError,
@@ -336,7 +406,7 @@ def run_expression_pack(
     model: str,
     overwrite: bool = False,
     create_zip: bool = True,
-    image_generator: Callable[..., bytes] | None = None,
+    image_generator: NormalizedPngGenerator | None = None,
 ) -> ExpressionPackResult:
     paths = resolve_expression_paths(root, character)
     images = generate_expression_images(
@@ -409,7 +479,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             overwrite=args.overwrite,
             create_zip=not args.no_zip,
         )
-    except (OSError, ExpressionError, gemini.GeneratorError) as exc:
+    except (
+        OSError,
+        ExpressionError,
+        gemini.GeneratorError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     print(f"Generated: {len(result.images.generated)}")
@@ -446,7 +522,7 @@ def request_expression_image(
     }
     parts = [{"text": prompt}]
     parts.extend(
-        bootstrap.encode_reference_resized(path)
+        encode_expression_reference(path)
         for path in reference_paths
     )
     payload = {

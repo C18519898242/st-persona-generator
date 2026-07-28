@@ -8,6 +8,7 @@ import unittest
 import base64
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -76,6 +77,10 @@ def png_bytes(
     color = (20, 40, 60, 0) if mode == "RGBA" else (20, 40, 60)
     Image.new(mode, size, color).save(output, format="PNG")
     return output.getvalue()
+
+
+def normalized_png_bytes() -> bytes:
+    return expressions.normalize_expression_png(png_bytes())
 
 
 def image_response(raw: bytes) -> dict:
@@ -240,6 +245,124 @@ class PromptAndRequestTests(unittest.TestCase):
             self.assertEqual(image.size, (896, 1280))
             self.assertIn("A", image.getbands())
 
+    def test_third_reference_preserves_png_alpha_in_native_payload(self):
+        calls = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            return image_response(png_bytes())
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            portrait = root / "portrait.png"
+            full_body = root / "full.png"
+            neutral = root / "neutral.png"
+            write_png(portrait)
+            write_png(full_body)
+            transparent_reference = Image.new(
+                "RGBA",
+                (2100, 100),
+                (20, 40, 60, 255),
+            )
+            transparent_reference.putpixel((0, 0), (20, 40, 60, 0))
+            transparent_reference.save(neutral, format="PNG")
+
+            expressions.request_expression_image(
+                prompt="test prompt",
+                reference_paths=(portrait, full_body, neutral),
+                api_key="secret",
+                base_url="https://example.test/v1beta",
+                model="gemini-test",
+                transport=transport,
+                sleeper=lambda _: None,
+            )
+
+        third_reference = calls[0]["contents"][0]["parts"][3]["inlineData"]
+        encoded = base64.b64decode(third_reference["data"])
+        with Image.open(io.BytesIO(encoded)) as image:
+            image.load()
+            self.assertEqual(third_reference["mimeType"], "image/png")
+            self.assertIn("A", image.getbands())
+            self.assertLessEqual(max(image.size), 2048)
+            self.assertLess(image.getchannel("A").getextrema()[0], 255)
+
+    def test_request_retries_429_and_invalid_image_before_success(self):
+        outcomes = [
+            expressions.gemini.HttpStatusError(429, "slow down"),
+            image_response(b"not an image"),
+            image_response(png_bytes()),
+        ]
+        sleeps = []
+
+        def transport(url, headers, payload, timeout):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        result = expressions.request_expression_image(
+            prompt="test prompt",
+            reference_paths=(),
+            api_key="secret",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            transport=transport,
+            sleeper=sleeps.append,
+        )
+
+        self.assertEqual(outcomes, [])
+        self.assertEqual(sleeps, [1.0, 2.0])
+        with Image.open(io.BytesIO(result)) as image:
+            self.assertEqual(image.size, (896, 1280))
+            self.assertIn("A", image.getbands())
+
+    def test_request_raises_after_retry_exhaustion(self):
+        calls = []
+        sleeps = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            return {}
+
+        with self.assertRaises(expressions.gemini.RetryableGenerationError):
+            expressions.request_expression_image(
+                prompt="test prompt",
+                reference_paths=(),
+                api_key="secret",
+                base_url="https://example.test/v1beta",
+                model="gemini-test",
+                transport=transport,
+                sleeper=sleeps.append,
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_request_does_not_retry_nonretryable_http_status(self):
+        calls = []
+        sleeps = []
+
+        def transport(url, headers, payload, timeout):
+            calls.append(payload)
+            raise expressions.gemini.HttpStatusError(400, "bad request")
+
+        with self.assertRaisesRegex(
+            expressions.gemini.HttpStatusError,
+            "HTTP 400",
+        ):
+            expressions.request_expression_image(
+                prompt="test prompt",
+                reference_paths=(),
+                api_key="secret",
+                base_url="https://example.test/v1beta",
+                model="gemini-test",
+                transport=transport,
+                sleeper=sleeps.append,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
 
 class GenerationWorkflowTests(unittest.TestCase):
     def setUp(self):
@@ -269,7 +392,7 @@ class GenerationWorkflowTests(unittest.TestCase):
 
         def generator(**kwargs):
             calls.append(kwargs)
-            return png_bytes()
+            return normalized_png_bytes()
 
         result = expressions.generate_expression_images(
             self.paths,
@@ -296,7 +419,7 @@ class GenerationWorkflowTests(unittest.TestCase):
 
         def generator(**kwargs):
             calls.append(kwargs["label"])
-            return png_bytes()
+            return normalized_png_bytes()
 
         result = expressions.generate_expression_images(
             self.paths,
@@ -325,7 +448,7 @@ class GenerationWorkflowTests(unittest.TestCase):
 
         def generator(**kwargs):
             calls.append(kwargs["label"])
-            return png_bytes()
+            return normalized_png_bytes()
 
         expressions.generate_expression_images(
             self.paths,
@@ -344,7 +467,7 @@ class GenerationWorkflowTests(unittest.TestCase):
             calls.append(label)
             if label == "anger":
                 raise expressions.ExpressionError("planned failure")
-            return png_bytes()
+            return normalized_png_bytes()
 
         result = expressions.generate_expression_images(
             self.paths,
@@ -357,6 +480,49 @@ class GenerationWorkflowTests(unittest.TestCase):
         self.assertEqual(result.failed, ("anger",))
         self.assertIn("surprise", calls)
         self.assertFalse((self.paths.output_dir / "anger.png").exists())
+
+    def test_bootstrap_reference_failure_does_not_stop_later_labels(self):
+        calls = []
+
+        def generator(**kwargs):
+            label = kwargs["label"]
+            calls.append(label)
+            if label == "anger":
+                raise expressions.bootstrap.BootstrapError("bad reference")
+            return expressions.normalize_expression_png(png_bytes())
+
+        result = expressions.generate_expression_images(
+            self.paths,
+            api_key="key",
+            base_url="https://example.test/v1beta",
+            model="gemini-test",
+            image_generator=generator,
+        )
+
+        self.assertEqual(result.failed, ("anger",))
+        self.assertIn("surprise", calls)
+
+    def test_injected_generator_returns_normalized_png_without_second_fit(self):
+        normalized = expressions.normalize_expression_png(png_bytes())
+
+        def generator(**kwargs):
+            return normalized
+
+        with mock.patch.object(
+            expressions,
+            "normalize_expression_png",
+            wraps=expressions.normalize_expression_png,
+        ) as normalize:
+            result = expressions.generate_expression_images(
+                self.paths,
+                api_key="key",
+                base_url="https://example.test/v1beta",
+                model="gemini-test",
+                image_generator=generator,
+            )
+
+        self.assertEqual(result.failed, ())
+        self.assertEqual(normalize.call_count, 0)
 
 
 class ZipPackagingTests(unittest.TestCase):
@@ -398,6 +564,23 @@ class ZipPackagingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.character = "cli-character"
+        self.character_dir = self.root / self.character
+        self.paths = expressions.ExpressionPaths(
+            root=self.root,
+            character=self.character,
+            character_dir=self.character_dir,
+            profile_path=self.character_dir / "profile.json",
+            portrait_path=self.character_dir / "portrait.png",
+            full_body_path=self.character_dir / "full-body.png",
+            output_dir=self.character_dir / "expressions",
+            zip_path=self.character_dir / f"{self.character}_expressions.zip",
+        )
+
     def test_parser_exposes_required_options(self):
         args = expressions.build_parser().parse_args([
             "--character", "cli-character",
@@ -418,6 +601,87 @@ class CliTests(unittest.TestCase):
             code = expressions.main([
                 "--character", "missing-character",
                 "--root", temp,
+            ])
+
+        self.assertEqual(code, 1)
+
+    def test_main_returns_zero_after_successful_completion(self):
+        pack_result = expressions.ExpressionPackResult(
+            paths=self.paths,
+            images=expressions.ExpressionRunResult(
+                generated=expressions.EXPRESSION_LABELS,
+                skipped=(),
+                failed=(),
+            ),
+            zip_path=self.paths.zip_path,
+        )
+        with (
+            mock.patch.object(expressions.gemini, "load_env_file"),
+            mock.patch.object(
+                expressions,
+                "run_expression_pack",
+                return_value=pack_result,
+            ),
+        ):
+            code = expressions.main([
+                "--character", self.character,
+                "--root", str(self.root),
+            ])
+
+        self.assertEqual(code, 0)
+
+    def test_main_returns_nonzero_when_images_failed_is_nonempty(self):
+        pack_result = expressions.ExpressionPackResult(
+            paths=self.paths,
+            images=expressions.ExpressionRunResult(
+                generated=(),
+                skipped=(),
+                failed=("anger",),
+            ),
+            zip_path=None,
+        )
+        with (
+            mock.patch.object(expressions.gemini, "load_env_file"),
+            mock.patch.object(
+                expressions,
+                "run_expression_pack",
+                return_value=pack_result,
+            ),
+        ):
+            code = expressions.main([
+                "--character", self.character,
+                "--root", str(self.root),
+            ])
+
+        self.assertEqual(code, 1)
+
+    def test_main_returns_nonzero_when_zip_packaging_raises(self):
+        completed = expressions.ExpressionRunResult(
+            generated=expressions.EXPRESSION_LABELS,
+            skipped=(),
+            failed=(),
+        )
+        with (
+            mock.patch.object(expressions.gemini, "load_env_file"),
+            mock.patch.object(
+                expressions,
+                "resolve_expression_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(
+                expressions,
+                "generate_expression_images",
+                return_value=completed,
+            ),
+            mock.patch.object(
+                expressions,
+                "create_expression_zip",
+                side_effect=zipfile.BadZipFile("packaging failed"),
+            ),
+        ):
+            code = expressions.main([
+                "--character", self.character,
+                "--root", str(self.root),
             ])
 
         self.assertEqual(code, 1)
